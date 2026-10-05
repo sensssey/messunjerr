@@ -47,7 +47,7 @@ function Show-Help {
 Команды (./dev.ps1 <команда>):
 
   init        создать deploy/.env со случайными паролями (один раз)
-  up          поднять PostgreSQL, Redis, Mailpit и API; миграции применяются сами
+  up          поднять PostgreSQL, Redis, Mailpit, API и воркеры; миграции применяются сами
   down        остановить стек (данные сохраняются)
   restart     перезапустить API
   reset       остановить стек и удалить его данные (тома PostgreSQL и Redis)
@@ -82,7 +82,7 @@ switch ($Cmd) {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     'up' {
-        Invoke-Compose up -d --build --wait api mailpit
+        Invoke-Compose up -d --build --wait api worker-default mailpit
         Write-Host 'API:     http://localhost:8000/api/v1/docs'
         Write-Host 'Mailpit: http://localhost:8025'
     }

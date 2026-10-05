@@ -18,6 +18,14 @@ class InvalidEmailError(ValueError):
         self.problem = problem
 
 
+def mask_email(address: str) -> str:
+    """`ivan.petrov@example.com` -> `i***@example.com`: для писем, где адрес нельзя показывать целиком."""
+    local, _, domain = address.partition("@")
+    if not domain:
+        return "***"
+    return f"{local[:1]}***@{domain}"
+
+
 def normalize_email(raw: str) -> str:
     """Возвращает адрес в виде хранения или бросает `InvalidEmailError`.
 

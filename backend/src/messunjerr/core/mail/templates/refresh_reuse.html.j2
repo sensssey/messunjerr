@@ -1,0 +1,11 @@
+{% extends "_base.html.j2" %}
+{% block title %}Сессия закрыта{% endblock %}
+{% block heading %}Мы закрыли подозрительную сессию{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Мы закрыли одну из ваших сессий в {{ app_name }}{% if device %} ({{ device }}){% endif %}: её токен обновления был использован повторно. Так бывает, если токен перехватили.</p>
+<p style="margin:0 0 24px;">Если это были вы (например, сбой сети или две вкладки), просто войдите снова.</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ login_url }}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Войти</a>
+</p>
+<p style="margin:0;color:#4b5563;font-size:14px;">Если это были не вы, <a href="{{ reset_url }}">смените пароль</a>.</p>
+{% endblock %}

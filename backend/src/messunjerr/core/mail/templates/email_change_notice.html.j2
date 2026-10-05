@@ -1,0 +1,7 @@
+{% extends "_base.html.j2" %}
+{% block title %}Запрошена смена почты{% endblock %}
+{% block heading %}Запрошена смена почты{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Для вашего аккаунта в {{ app_name }} запрошена смена адреса почты на {{ new_email_masked }}. Адрес изменится, только когда владелец нового адреса подтвердит смену.</p>
+<p style="margin:0;color:#4b5563;font-size:14px;">Если это были не вы, срочно <a href="{{ reset_url }}">смените пароль</a>.</p>
+{% endblock %}

@@ -2,8 +2,11 @@
 
 from dataclasses import dataclass
 
+from redis.asyncio import Redis
+
 from messunjerr.identity.infra.jwt_service import TokenService, create_token_service
 from messunjerr.identity.infra.password_service import PasswordService
+from messunjerr.identity.infra.session_denylist import SessionDenylist
 from messunjerr.settings import Settings
 
 
@@ -11,15 +14,17 @@ from messunjerr.settings import Settings
 class IdentityServices:
     passwords: PasswordService
     tokens: TokenService
+    denylist: SessionDenylist
 
     def close(self) -> None:
         self.passwords.shutdown()
 
 
-async def create_identity_services(settings: Settings) -> IdentityServices:
+async def create_identity_services(settings: Settings, redis: Redis) -> IdentityServices:
     services = IdentityServices(
         passwords=PasswordService.from_settings(settings),
         tokens=create_token_service(settings),
+        denylist=SessionDenylist(redis, ttl_seconds=settings.access_token_ttl_seconds),
     )
     await services.passwords.warm_up()
     return services

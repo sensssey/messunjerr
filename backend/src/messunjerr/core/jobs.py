@@ -17,6 +17,8 @@ QUEUES: tuple[str, ...] = (QUEUE_EMAIL, QUEUE_DEFAULT, QUEUE_MEDIA)
 
 # Имена задач: общий договор между теми, кто ставит задачу (контексты), и воркером.
 TASK_SEND_EMAIL = "send_email"
+TASK_CLEANUP_UNVERIFIED_ACCOUNTS = "cleanup_unverified_accounts"
+TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY = "cleanup_tokens_and_idempotency"
 
 
 class JobQueue(Protocol):

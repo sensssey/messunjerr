@@ -1,0 +1,7 @@
+{% extends "_base.html.j2" %}
+{% block title %}Почта аккаунта изменена{% endblock %}
+{% block heading %}Почта аккаунта изменена{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Адрес почты вашего аккаунта в {{ app_name }} изменён на {{ new_email_masked }}. С этого момента письма приходят туда, а этот адрес больше не привязан к аккаунту.</p>
+<p style="margin:0;color:#4b5563;font-size:14px;">Если это были не вы, срочно <a href="{{ reset_url }}">восстановите доступ</a>.</p>
+{% endblock %}

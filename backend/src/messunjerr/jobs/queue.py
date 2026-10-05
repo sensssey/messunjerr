@@ -15,13 +15,7 @@ from redis.exceptions import RedisError
 from messunjerr.core.codes import ErrorCode
 from messunjerr.core.errors import DomainError
 from messunjerr.core.jobs import QUEUE_DEFAULT
-
-QUEUE_KEY_PREFIX = "arq:queue:"
-
-
-def queue_key(queue: str) -> str:
-    """Имя очереди в Redis: все ключи arq лежат под префиксом `arq:` (4.13)."""
-    return f"{QUEUE_KEY_PREFIX}{queue}"
+from messunjerr.jobs.health import queue_key
 
 
 def json_serializer(value: dict[str, Any]) -> bytes:

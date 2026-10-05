@@ -14,7 +14,10 @@ from pydantic import SecretStr
 from messunjerr.core.jobs import (
     QUEUE_DEFAULT,
     QUEUE_EMAIL,
+    QUEUE_MEDIA,
     QUEUES,
+    TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
+    TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
     TASK_SEND_EMAIL,
     InMemoryJobQueue,
 )
@@ -32,7 +35,7 @@ from messunjerr.jobs.tasks import (
     SEND_EMAIL_RETRY_BASE_SECONDS,
     send_email,
 )
-from messunjerr.jobs.worker import build_worker, functions_for
+from messunjerr.jobs.worker import build_worker, cron_jobs_for, functions_for
 from messunjerr.settings import Settings
 
 SENDER = "messunjerr <no-reply@messunjerr.local>"
@@ -93,6 +96,68 @@ def test_account_exists_email() -> None:
     assert message["Subject"] == "Вы уже зарегистрированы в messunjerr"
     assert context["login_url"] in text
     assert context["reset_url"] in html
+
+
+SECURITY_MAILS: dict[str, tuple[dict[str, Any], str, list[str]]] = {
+    "reset_password": (
+        {"reset_url": "http://x/reset-password#token=tok", "token": "tok", "ttl_minutes": 60},
+        "Сброс пароля в messunjerr",
+        ["http://x/reset-password#token=tok", "tok", "60 минут", "все ваши сессии будут закрыты"],
+    ),
+    "password_changed": (
+        {
+            "when": "05.10.2026 12:34 UTC",
+            "login_url": "http://x/login",
+            "reset_url": "http://x/forgot",
+        },
+        "Пароль изменён в messunjerr",
+        ["05.10.2026 12:34 UTC", "http://x/forgot", "http://x/login"],
+    ),
+    "refresh_reuse": (
+        {
+            "device": "Firefox на Windows",
+            "login_url": "http://x/login",
+            "reset_url": "http://x/forgot",
+        },
+        "Подозрительная активность: сессия в messunjerr закрыта",
+        ["Firefox на Windows", "http://x/login", "http://x/forgot", "использован повторно"],
+    ),
+    "email_change_confirm": (
+        {"confirm_url": "http://x/confirm-email#token=tok", "token": "tok", "ttl_minutes": 60},
+        "Подтвердите новый адрес почты в messunjerr",
+        ["http://x/confirm-email#token=tok", "tok", "60 минут"],
+    ),
+    "email_change_notice": (
+        {"new_email_masked": "n***@example.org", "reset_url": "http://x/forgot"},
+        "Запрошена смена почты в messunjerr",
+        ["n***@example.org", "http://x/forgot"],
+    ),
+    "email_changed": (
+        {"new_email_masked": "n***@example.org", "reset_url": "http://x/forgot"},
+        "Почта аккаунта в messunjerr изменена",
+        ["n***@example.org", "http://x/forgot"],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SECURITY_MAILS))
+def test_security_emails_are_russian_and_carry_their_links(name: str) -> None:
+    context, subject, fragments = SECURITY_MAILS[name]
+    message = render_email(name, context, sender=SENDER, to="user@example.com")
+    text, html = bodies(message)
+    assert message["Subject"] == subject
+    assert "Здравствуйте" in text
+    for fragment in fragments:
+        assert fragment in text, fragment
+    assert "<html" in html
+    assert fragments[0] in html
+
+
+def test_reuse_notice_works_without_a_device_label() -> None:
+    context = {"device": None, "login_url": "http://x/login", "reset_url": "http://x/forgot"}
+    text, _ = bodies(render_email("refresh_reuse", context, sender=SENDER, to="user@example.com"))
+    assert "None" not in text
+    assert "()" not in text
 
 
 def test_a_missing_template_variable_is_an_error_not_an_empty_gap() -> None:
@@ -235,9 +300,36 @@ def test_email_queue_has_the_send_email_task_with_retries_and_no_stored_result()
 
 
 def test_a_queue_without_tasks_does_not_get_a_worker() -> None:
-    assert functions_for(QUEUE_DEFAULT) == []
+    assert functions_for(QUEUE_MEDIA) == []
+    assert cron_jobs_for(QUEUE_MEDIA) == []
     with pytest.raises(RuntimeError, match="нет задач"):
-        build_worker(QUEUE_DEFAULT, settings())
+        build_worker(QUEUE_MEDIA, settings())
+
+
+def test_default_queue_runs_housekeeping_on_a_schedule() -> None:
+    jobs = {job.name: job for job in cron_jobs_for(QUEUE_DEFAULT)}
+
+    assert set(jobs) == {TASK_CLEANUP_UNVERIFIED_ACCOUNTS, TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY}
+    nightly = jobs[TASK_CLEANUP_UNVERIFIED_ACCOUNTS]
+    hourly = jobs[TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY]
+    assert (nightly.hour, nightly.minute) == (3, 10)  # раз в сутки, ночью
+    assert (hourly.hour, hourly.minute) == (None, 17)  # каждый час
+    for job in jobs.values():
+        assert job.unique  # несколько воркеров не запускают одну задачу дважды
+        assert job.keep_result_s == 0
+        assert job.max_tries == 1  # следующий запуск и так придёт по расписанию
+    assert cron_jobs_for(QUEUE_EMAIL) == []
+
+
+def test_the_default_worker_is_built_from_cron_jobs_and_keeps_schedules_in_utc() -> None:
+    worker = build_worker(QUEUE_DEFAULT, settings(), handle_signals=False)
+
+    assert set(worker.functions) == {
+        TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
+        TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
+    }
+    assert worker.timezone is UTC
+    assert worker.queue_name == "arq:queue:default"
 
 
 # ----------------------------------------------------------------------------- задача send_email

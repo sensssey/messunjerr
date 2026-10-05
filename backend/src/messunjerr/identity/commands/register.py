@@ -24,20 +24,16 @@ from messunjerr.core.errors import DomainError, ErrorItem
 from messunjerr.core.ids import uuid7
 from messunjerr.core.jobs import JobQueue
 from messunjerr.core.uow import UnitOfWork
+from messunjerr.identity.commands.common import password_policy_error
 from messunjerr.identity.commands.mail import issue_verification_email, send_account_exists_email
 from messunjerr.identity.domain.errors import username_taken
 from messunjerr.identity.domain.events import UserRegistered, record
-from messunjerr.identity.domain.passwords import PasswordProblem, check_password_policy
+from messunjerr.identity.domain.passwords import check_password_policy
 from messunjerr.identity.domain.usernames import UsernameProblem, check_username
 from messunjerr.identity.infra.models import UserRow
 from messunjerr.identity.infra.password_service import PasswordService
 from messunjerr.identity.infra.repositories import UserRepository, violated_constraint
 from messunjerr.settings import Settings
-
-_PASSWORD_ITEM_CODES = {
-    PasswordProblem.TOO_SHORT: ItemCode.STRING_TOO_SHORT,
-    PasswordProblem.TOO_LONG: ItemCode.STRING_TOO_LONG,
-}
 
 
 class RegisterOutcome(StrEnum):
@@ -91,14 +87,7 @@ def _validate(command: RegisterUser) -> None:
         command.password, username=command.username, email=command.email
     )
     if problem is not None:
-        items.append(
-            ErrorItem(
-                "/body/password",
-                _PASSWORD_ITEM_CODES.get(problem, ItemCode.PASSWORD_TOO_WEAK),
-                "The password does not meet the requirements.",
-                {"reason": problem.value},
-            )
-        )
+        items.append(password_policy_error(problem, "/body/password"))
     if items:
         raise DomainError(ErrorCode.VALIDATION_ERROR, errors=items)
 

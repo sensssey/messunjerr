@@ -16,3 +16,21 @@ def set_refresh_cookie(response: Response, token: str, *, max_age: int) -> None:
         httponly=True,
         samesite="strict",
     )
+
+
+def clear_refresh_cookie(response: Response) -> None:
+    """Стирает cookie: те же путь и атрибуты, `Max-Age=0`."""
+    response.delete_cookie(
+        key=REFRESH_COOKIE,
+        path=REFRESH_COOKIE_PATH,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def refresh_cookie_clearing_header() -> str:
+    """Значение `Set-Cookie`, стирающее cookie, для ответов-ошибок (их собирает обработчик исключений)."""
+    probe = Response()
+    clear_refresh_cookie(probe)
+    return probe.headers["set-cookie"]

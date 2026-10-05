@@ -22,6 +22,8 @@ class PasswordProblem(StrEnum):
     TOO_SIMPLE = "too_simple"
     SAME_AS_USERNAME = "same_as_username"
     SAME_AS_EMAIL = "same_as_email"
+    SAME_AS_CURRENT = "same_as_current"
+    """Новый пароль совпадает с текущим: проверяется командой смены пароля, где известен хэш."""
 
 
 @cache

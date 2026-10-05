@@ -134,7 +134,20 @@ def problem_response(
         extensions=extensions,
         status=status,
     )
-    response_headers = {"X-Request-ID": request_id, **(headers or {})}
+    # Ответ об ошибке не кэшируется нигде: в нём может быть и состояние аккаунта, и `request_id`.
+    # `RateLimit-*` берутся из состояния запроса (их кладёт проверка лимитов), явные заголовки главнее.
+    state = scope.get("state")
+    limit_headers: dict[str, str] = {}
+    if isinstance(state, dict):
+        stashed = state.get("ratelimit_headers")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        if isinstance(stashed, dict):
+            limit_headers = cast("dict[str, str]", stashed)
+    response_headers = {
+        "X-Request-ID": request_id,
+        "Cache-Control": "no-store",
+        **limit_headers,
+        **(headers or {}),
+    }
     return JSONResponse(
         body,
         status_code=body["status"],

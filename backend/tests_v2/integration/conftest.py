@@ -156,6 +156,9 @@ def test_settings(base_settings: Settings, database: DatabaseUnderTest) -> Setti
         # Адрес SMTP (Mailpit) нужен только сквозному тесту писем; без него тест пропускается.
         smtp_url=base_settings.smtp_url,
         mail_from="messunjerr <no-reply@messunjerr.local>",
+        # Лимиты выключены: тесты делают много регистраций и входов с одного адреса. Тесты самих
+        # лимитов собирают приложение с `rate_limits_enabled=True` и малыми значениями.
+        rate_limits_enabled=False,
     )
 
 

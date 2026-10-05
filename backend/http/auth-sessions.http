@@ -1,0 +1,237 @@
+### messunjerr API v2: сессии, пароли и лимиты (спринт S2)
+#
+# Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
+# токены из писем и cookie тогда копируются руками). Стек поднимает `make up` или `./dev.ps1 up`,
+# письма смотрим в Mailpit: http://localhost:8025. Выполняйте запросы по порядку, сверху вниз.
+#
+# Refresh-токен живёт только в cookie `__Secure-mj_refresh` (в теле ответа его нет). Cookie с
+# атрибутом Secure по обычному http клиент сам не отправляет, поэтому скрипты ниже достают её из
+# `Set-Cookie` и подставляют заголовком `Cookie`. Для `refresh` и `logout` нужен ещё заголовок
+# `X-Requested-With: messunjerr`: чужой сайт выставить его в запросе из браузера не может (CSRF).
+
+@host = http://localhost:8000
+@mailpit = http://localhost:8025
+@password = correct horse battery staple
+@new_password = another sturdy passphrase 42
+
+### Подготовка ###########################################################################
+
+### 1. Регистрация нового пользователя (имя и адрес генерируются при каждом запуске)
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("demo_user", "demo_" + suffix);
+    client.global.set("demo_email", "demo_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{demo_email}}",
+  "username": "{{demo_user}}",
+  "password": "{{password}}",
+  "accept_terms": true
+}
+
+### 2. Письмо подтверждения: последнее письмо для этого адреса (воркер отправляет за секунду-две)
+GET {{mailpit}}/api/v1/search?query=to:{{demo_email}}&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+### 2а. Токен подтверждения из текста письма
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("verify_token", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 3. Подтверждение почты: вход выполняется сразу, запоминаем access-токен и refresh-cookie
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{verify_token}}" }
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+    client.global.set("session_id", response.body.session_id);
+    client.global.set("refresh_cookie", response.headers.valueOf("Set-Cookie").match(/__Secure-mj_refresh=([^;]+)/)[1]);
+%}
+
+### Сессии ################################################################################
+
+### 4. Вторая сессия: вход «с телефона»
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{ "login": "{{demo_user}}", "password": "{{password}}", "device_label": "Телефон" }
+
+> {%
+    client.global.set("phone_access_token", response.body.access_token);
+    client.global.set("phone_session_id", response.body.session_id);
+%}
+
+### 5. Активные сессии: `current` отмечает ту, с которой сделан запрос; адрес показан маской
+GET {{host}}/api/v1/auth/sessions
+Authorization: Bearer {{access_token}}
+
+### 6. Закрыть чужую (телефонную) сессию. Свою можно закрыть так же: тогда стирается cookie
+DELETE {{host}}/api/v1/auth/sessions/{{phone_session_id}}
+Authorization: Bearer {{access_token}}
+
+### 7. Токен закрытой сессии перестаёт приниматься сразу: 401 session_revoked
+GET {{host}}/api/v1/me
+Authorization: Bearer {{phone_access_token}}
+
+### Refresh: ротация и защита от повторного использования ###############################
+
+### 8. Обновление: приходит новый access-токен и новая cookie. Старую cookie запоминаем
+< {%
+    client.global.set("old_refresh_cookie", client.global.get("refresh_cookie"));
+%}
+POST {{host}}/api/v1/auth/refresh
+X-Requested-With: messunjerr
+Cookie: __Secure-mj_refresh={{refresh_cookie}}
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+    client.global.set("refresh_cookie", response.headers.valueOf("Set-Cookie").match(/__Secure-mj_refresh=([^;]+)/)[1]);
+%}
+
+### 9. Старая cookie в течение 10 секунд после ротации (гонка двух вкладок): 200 и только access-токен,
+# заголовка Set-Cookie нет. Выполните сразу после запроса 8.
+POST {{host}}/api/v1/auth/refresh
+X-Requested-With: messunjerr
+Cookie: __Secure-mj_refresh={{old_refresh_cookie}}
+
+### 10. Та же старая cookie позже 10 секунд: 401 refresh_reused, сессия закрывается, владельцу
+# уходит письмо «Подозрительная активность», cookie стирается. Подождите 11 секунд и выполните.
+POST {{host}}/api/v1/auth/refresh
+X-Requested-With: messunjerr
+Cookie: __Secure-mj_refresh={{old_refresh_cookie}}
+
+### 11. Без заголовка X-Requested-With: 403 csrf_failed (запрос до проверки токена не доходит)
+POST {{host}}/api/v1/auth/refresh
+Cookie: __Secure-mj_refresh={{refresh_cookie}}
+
+### Выход ##################################################################################
+
+### 12. Новый вход, чтобы было что закрывать
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{ "login": "{{demo_email}}", "password": "{{password}}" }
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+    client.global.set("refresh_cookie", response.headers.valueOf("Set-Cookie").match(/__Secure-mj_refresh=([^;]+)/)[1]);
+%}
+
+### 13. Выйти везде (нужен пароль): закрывает все сессии; `keep_current: true` оставляет текущую.
+# С неверным паролем: 403 reauth_failed (и попытка тратит тот же лимит, что вход).
+POST {{host}}/api/v1/auth/logout-all
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "password": "{{password}}", "keep_current": false }
+
+### 14. После этого токен не принимается: 401 session_revoked
+GET {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+
+### 15. Обычный выход одной сессии: всегда 204, повтор безопасен
+POST {{host}}/api/v1/auth/logout
+X-Requested-With: messunjerr
+Cookie: __Secure-mj_refresh={{refresh_cookie}}
+
+### Пароль ################################################################################
+
+### 16. «Забыли пароль»: ответ 202 одинаков для любого адреса, письмо уходит только существующему
+POST {{host}}/api/v1/auth/password/forgot
+Content-Type: application/json
+
+{ "email": "{{demo_email}}" }
+
+### 16а. Письмо со ссылкой сброса (последнее для этого адреса) и токен из него
+GET {{mailpit}}/api/v1/search?query=to:{{demo_email}}&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+###
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("reset_token", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 17. Сброс пароля: все сессии закрываются, владельцу уходит письмо «Пароль изменён», входа нет
+POST {{host}}/api/v1/auth/password/reset
+Content-Type: application/json
+
+{ "token": "{{reset_token}}", "new_password": "{{new_password}}" }
+
+### 18. Старый пароль больше не подходит: 401 invalid_credentials
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{ "login": "{{demo_email}}", "password": "{{password}}" }
+
+### 19. Новый пароль подходит
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{ "login": "{{demo_email}}", "password": "{{new_password}}" }
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+%}
+
+### 20. Смена пароля при входе: нужен текущий пароль, остальные сессии закрываются
+# (`revoke_other_sessions: false` оставит их). Тот же пароль: 422 password_too_weak, reason same_as_current.
+POST {{host}}/api/v1/auth/password/change
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "current_password": "{{new_password}}", "new_password": "a third sturdy passphrase 7" }
+
+### Смена почты ###########################################################################
+
+### 21. Запрос смены почты (нужен пароль): токен уходит на НОВЫЙ адрес, старый получает уведомление.
+# Ответ 202 одинаков и для занятого адреса.
+POST {{host}}/api/v1/auth/email/change
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "new_email": "changed_{{demo_user}}@example.com", "password": "a third sturdy passphrase 7" }
+
+### 21а. Письмо на новый адрес и токен из него
+GET {{mailpit}}/api/v1/search?query=to:changed_{{demo_user}}@example.com&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+###
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("email_token", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 22. Подтверждение нового адреса: адрес аккаунта меняется, сессии остаются
+POST {{host}}/api/v1/auth/email/confirm
+Content-Type: application/json
+
+{ "token": "{{email_token}}" }
+
+### Лимиты ################################################################################
+
+### 23. Лимит входа: 20 попыток за 10 минут с одного адреса, 21-я получает 429 с Retry-After.
+# Каждый ответ (и ошибки тоже) несёт RateLimit-Limit, RateLimit-Remaining и RateLimit-Reset.
+# Повторите запрос 21 раз подряд.
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{ "login": "nobody@example.com", "password": "wrong password!" }

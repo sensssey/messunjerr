@@ -1,0 +1,55 @@
+# Бакеты лимитов запросов (спецификация 4.14). Это значения по умолчанию, они зашиты в образ.
+# Файл, на который указывает RATE_LIMITS_FILE, переопределяет их по полям: достаточно указать
+# только то, что меняется, например `[auth_login_ip]` и `limit = 50`.
+#
+# limit            сколько запросов разрешено за окно; он же ёмкость бакета (допустимый всплеск)
+# window           окно: число и единица (s секунды, m минуты, h часы, d сутки)
+# on_unavailable   что делать, если Redis недоступен: "allow" (пропускать, в журнал идёт
+#                  предупреждение) или "deny" (отвечать 503). Бакеты, которые охраняют перебор
+#                  паролей и рассылку писем, закрываются: без счёта попыток подбор не остановить.
+
+[auth_login_ip]            # POST /auth/login: все попытки с одного адреса
+limit = 20
+window = "10m"
+on_unavailable = "deny"
+
+[auth_login_account]       # POST /auth/login и подтверждение паролем: неудачные попытки по аккаунту
+limit = 5
+window = "15m"
+on_unavailable = "deny"
+
+[auth_register_ip]         # POST /auth/register
+limit = 5
+window = "1h"
+on_unavailable = "deny"
+
+[auth_email_ip]            # письма и токены из писем (повтор подтверждения, «забыли пароль», подтверждение
+                           # почты, сброс пароля, подтверждение новой почты): по адресу клиента
+limit = 10
+window = "1h"
+on_unavailable = "deny"
+
+[auth_email_addr]          # то же по почтовому адресу (в Redis хранится хэш адреса)
+limit = 3
+window = "1h"
+on_unavailable = "deny"
+
+[auth_refresh_session]     # POST /auth/refresh: по сессии
+limit = 60
+window = "1m"
+on_unavailable = "allow"
+
+[username_check_ip]        # GET /auth/username-available
+limit = 30
+window = "1m"
+on_unavailable = "allow"
+
+[api_read]                 # все GET, по пользователю
+limit = 600
+window = "1m"
+on_unavailable = "allow"
+
+[api_write]                # общий потолок для остальных методов, по пользователю
+limit = 120
+window = "1m"
+on_unavailable = "allow"

@@ -1,20 +1,32 @@
-"""Помощники интеграционных тестов identity: регистрация, токен из письма, вход."""
+"""Помощники интеграционных тестов identity: регистрация, токены из писем, вход, refresh, лимиты."""
 
 import re
 import uuid
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
+from asgi_lifespan import LifespanManager
+from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from messunjerr.core.jobs import InMemoryJobQueue
 from messunjerr.core.mail import render_email
+from messunjerr.core.ratelimit import load_buckets
+from messunjerr.main import create_app
+from messunjerr.settings import Settings
 
 PASSWORD = "correct horse battery staple"
+NEW_PASSWORD = "another sturdy passphrase 42"
 SENDER = "messunjerr <no-reply@messunjerr.local>"
 REFRESH_COOKIE = "__Secure-mj_refresh"
+CSRF = {"X-Requested-With": "messunjerr", "Origin": "http://localhost:3000"}
+REFRESH = "/api/v1/auth/refresh"
+LOGIN = "/api/v1/auth/login"
+ME = "/api/v1/me"
 
 
 async def fetch_all(engine: AsyncEngine, sql: str, **params: Any) -> list[dict[str, Any]]:
@@ -96,10 +108,83 @@ class SignedInUser:
 
     @property
     def refresh_token(self) -> str:
-        cookie = self.response.headers["set-cookie"]
-        found = re.match(rf"{REFRESH_COOKIE}=([^;]+);", cookie)
-        assert found
-        return found.group(1)
+        return cookie_token(self.response)
+
+    @property
+    def session_id(self) -> str:
+        return str(self.auth["session_id"])
+
+
+def cookie_token(response: httpx.Response) -> str:
+    """Refresh-токен из заголовка `Set-Cookie` ответа."""
+    found = re.match(rf"{REFRESH_COOKIE}=([^;]+);", response.headers["set-cookie"])
+    assert found, f"в ответе нет cookie с refresh-токеном: {response.headers.get('set-cookie')}"
+    return found.group(1)
+
+
+def cookie_header(token: str) -> dict[str, str]:
+    """Cookie запроса. Передаём заголовком: `Secure`-cookie клиент по http сам бы не отправил."""
+    return {"Cookie": f"{REFRESH_COOKIE}={token}"}
+
+
+def refresh_headers(token: str, **extra: str) -> dict[str, str]:
+    return {**CSRF, **cookie_header(token), **extra}
+
+
+async def do_refresh(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    return await client.post(REFRESH, headers=refresh_headers(token))
+
+
+async def login_again(client: httpx.AsyncClient, user: SignedInUser, **extra: Any) -> SignedInUser:
+    """Ещё один вход тем же пользователем: вторая сессия (второе устройство)."""
+    response = await client.post(
+        LOGIN,
+        json={"login": user.credentials["email"], "password": PASSWORD},
+        headers=extra.pop("headers", None),
+    )
+    assert response.status_code == 200, response.text
+    return SignedInUser(credentials=user.credentials, auth=response.json(), response=response)
+
+
+def email_jobs(jobs: InMemoryJobQueue, template: str, to: str | None = None) -> list[Any]:
+    """Письма `template`, поставленные в очередь (для `to`, если задан)."""
+    return [
+        job
+        for job in jobs.named("send_email")
+        if job.kwargs["template"] == template and (to is None or job.kwargs["to"] == to)
+    ]
+
+
+def token_in_email(jobs: InMemoryJobQueue, template: str, to: str) -> str:
+    """Токен из последнего письма `template` для `to`."""
+    matching = email_jobs(jobs, template, to)
+    assert matching, f"письмо {template} для {to} не поставлено в очередь"
+    return str(matching[-1].kwargs["context"]["token"])
+
+
+@asynccontextmanager
+async def limited_client(
+    test_settings: Settings,
+    jobs: InMemoryJobQueue,
+    *,
+    windows: dict[str, int] | None = None,
+    **limits: int,
+) -> AsyncGenerator[tuple[FastAPI, httpx.AsyncClient]]:
+    """Приложение с включёнными лимитами; `limits` меняют ёмкость бакетов, `windows` их окна (секунды)."""
+    buckets = {
+        name: replace(
+            config,
+            limit=limits.get(name, config.limit),
+            window_seconds=(windows or {}).get(name, config.window_seconds),
+        )
+        for name, config in load_buckets().items()
+    }
+    settings = test_settings.model_copy(update={"rate_limits_enabled": True})
+    application = create_app(settings, job_queue=jobs, rate_limits=buckets)
+    async with LifespanManager(application):
+        transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            yield application, http
 
 
 async def register(

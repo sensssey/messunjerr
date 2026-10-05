@@ -32,8 +32,8 @@ help: ## Показать команды
 init: ## Создать deploy/.env со случайными паролями
 	$(PYTHON) scripts/init_env.py
 
-up: ## Поднять стек: PostgreSQL, Redis, Mailpit, API (миграции применяются сами)
-	$(COMPOSE) up -d --build --wait api mailpit
+up: ## Поднять стек: PostgreSQL, Redis, Mailpit, API, воркеры (миграции применяются сами)
+	$(COMPOSE) up -d --build --wait api worker-default mailpit
 	@echo "API:     http://localhost:8000/api/v1/docs"
 	@echo "Mailpit: http://localhost:8025"
 

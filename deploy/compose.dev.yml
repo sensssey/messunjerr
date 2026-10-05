@@ -140,6 +140,23 @@ services:
       retries: 5
       start_period: 20s
 
+  # Плановые задачи (cron) очереди default: очистка неподтверждённых аккаунтов, токенов писем и
+  # ключей идемпотентности. Нужна база, поэтому ждёт миграций.
+  worker-default:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "worker", "--queue", "default", "--reload"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "worker", "--queue", "default", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   # Инструменты разработки (тесты, линтеры): `docker compose run --rm tools <команда>`.
   tools:
     <<: *backend

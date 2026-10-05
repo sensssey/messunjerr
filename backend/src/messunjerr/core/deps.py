@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from messunjerr.core.jobs import JobQueue
+from messunjerr.core.ratelimit import RateLimiter
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.settings import Settings
 
@@ -24,6 +25,7 @@ class AppResources:
     sessionmaker: async_sessionmaker[AsyncSession]
     redis: Redis
     jobs: JobQueue
+    limiter: RateLimiter
     expected_head: str | None
 
 

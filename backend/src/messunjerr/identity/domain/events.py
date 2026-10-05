@@ -18,7 +18,14 @@ class EmailVerified:
     user_id: uuid.UUID
 
 
-type UserEvent = UserRegistered | EmailVerified
+@dataclass(frozen=True, slots=True)
+class PasswordChanged:
+    """Пароль сменён или сброшен: потребителей в v1 нет (задел под уведомления и аналитику)."""
+
+    user_id: uuid.UUID
+
+
+type UserEvent = UserRegistered | EmailVerified | PasswordChanged
 
 
 def record(outbox: Outbox, event: UserEvent) -> None:

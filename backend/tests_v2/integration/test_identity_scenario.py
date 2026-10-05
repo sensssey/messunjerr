@@ -156,6 +156,9 @@ async def test_parallel_logins_do_not_block_the_event_loop(
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
             user = await verified_user(http, jobs)
             body = {"login": user.credentials["email"], "password": "wrong password here"}
+            # Прогрев: первый запрос по пути входа компилирует SQL-выражения и строит планы записи
+            # (десятки миллисекунд синхронной работы), к хэшированию это отношения не имеет.
+            assert (await http.post(LOGIN, json=body)).status_code == 401
             worst_lag = 0.0
             stop = asyncio.Event()
 

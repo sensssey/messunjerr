@@ -8,6 +8,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic.fields import FieldInfo
@@ -83,6 +84,12 @@ class Settings(BaseSettings):
     # --- Redis
     redis_url: SecretStr
     redis_socket_timeout_seconds: float = Field(default=2.0, gt=0)
+    redis_max_connections: int = Field(default=50, ge=1, le=1000)
+    redis_pool_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description="сколько ждать свободное соединение, когда все заняты (потом: Redis недоступен)",
+    )
 
     # --- HTTP
     request_body_limit_bytes: int = Field(default=1_048_576, ge=1024)
@@ -96,7 +103,27 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
     refresh_ttl_days: int = Field(default=30, ge=1, le=365)
     refresh_absolute_ttl_days: int = Field(default=90, ge=1, le=730)
+    refresh_race_window_seconds: int = Field(
+        default=10, ge=0, le=60, description="окно гонки двух вкладок при ротации refresh (4.7)"
+    )
     email_verification_ttl_hours: int = Field(default=24, ge=1, le=168)
+    password_reset_ttl_minutes: int = Field(default=60, ge=5, le=1440)
+    email_change_ttl_minutes: int = Field(default=60, ge=5, le=1440)
+    unverified_account_ttl_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="срок, после которого неподтверждённый аккаунт удаляется",
+    )
+    # Откуда принимаются запросы к cookie-ручкам (CSRF, 4.7): по умолчанию адрес клиента.
+    allowed_origins: Annotated[list[str], NoDecode] = []
+
+    # --- лимиты запросов (4.14): бакеты и значения в core/ratelimits.toml, файл их переопределяет
+    rate_limits_enabled: bool = True
+    rate_limits_file: str | None = None
+
+    # --- идемпотентность (5.1): сколько хранится сохранённый ответ
+    idempotency_ttl_hours: int = Field(default=24, ge=1, le=168)
 
     # --- пароли: Argon2id (по умолчанию профиль RFC 9106 с малой памятью); тесты уменьшают стоимость
     argon2_time_cost: int = Field(default=3, ge=1, le=20)
@@ -123,7 +150,7 @@ class Settings(BaseSettings):
     message_edit_window_hours: int = Field(default=48, ge=0)
     media_quota_bytes: int = Field(default=GIB, ge=0)
 
-    @field_validator("auth_methods", "reaction_palette", mode="before")
+    @field_validator("auth_methods", "reaction_palette", "allowed_origins", mode="before")
     @classmethod
     def _csv_lists(cls, value: Any) -> Any:
         return _split_csv(value)
@@ -153,6 +180,13 @@ class Settings(BaseSettings):
     def base_url(self) -> str:
         """Публичный адрес для ссылок в письмах; вне prod и stage по умолчанию локальный клиент."""
         return (self.public_base_url or "http://localhost:3000").rstrip("/")
+
+    @property
+    def origins(self) -> frozenset[str]:
+        """Допустимые источники запросов к cookie-ручкам: адрес клиента и `ALLOWED_ORIGINS`."""
+        parts = urlsplit(self.base_url)
+        client_origin = f"{parts.scheme}://{parts.netloc}"
+        return frozenset({client_origin, *(origin.rstrip("/") for origin in self.allowed_origins)})
 
     @property
     def strict_runtime(self) -> bool:

@@ -12,6 +12,7 @@ from messunjerr.core.schemas import RAW, ApiModel
 from messunjerr.identity.domain.emails import EmailProblem, InvalidEmailError, normalize_email
 from messunjerr.identity.domain.usernames import USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH
 from messunjerr.identity.queries.models import MeUser
+from messunjerr.identity.queries.sessions import SessionInfo
 
 
 def _valid_email(value: str) -> str:
@@ -74,6 +75,47 @@ class LoginRequest(ApiModel):
     login: Annotated[str, Field(min_length=1, max_length=254, description="Почта или ник.")]
     password: Annotated[str, RAW, Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)]
     device_label: Annotated[str, Field(max_length=100)] | None = None
+
+
+class LogoutAllRequest(ApiModel):
+    password: Annotated[str, RAW, Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)]
+    keep_current: StrictBool = Field(
+        default=False, description="Оставить текущую сессию (по умолчанию закрываются все)."
+    )
+
+
+class ForgotPasswordRequest(ApiModel):
+    email: Email
+
+
+class ResetPasswordRequest(ApiModel):
+    token: Annotated[str, Field(min_length=1, max_length=256)]
+    new_password: Password
+
+
+class ChangePasswordRequest(ApiModel):
+    current_password: Annotated[str, RAW, Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)]
+    new_password: Password
+    revoke_other_sessions: StrictBool = Field(
+        default=True, description="Закрыть остальные сессии (текущая остаётся)."
+    )
+
+
+class ChangeEmailRequest(ApiModel):
+    new_email: Email
+    password: Annotated[str, RAW, Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)]
+
+
+class ConfirmEmailRequest(ApiModel):
+    token: Annotated[str, Field(min_length=1, max_length=256)]
+
+
+class SessionsResponse(BaseModel):
+    items: list[SessionInfo]
+
+
+class ConfirmationSentResponse(BaseModel):
+    status: Literal["confirmation_sent"] = "confirmation_sent"
 
 
 class RegisterResponse(BaseModel):

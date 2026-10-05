@@ -9,12 +9,11 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
-from alembic import command
-
-from messunjerr.core.dbinit import init_database, plan_from_settings
 from messunjerr.core.jobs import QUEUE_EMAIL, QUEUES
-from messunjerr.core.migrations import alembic_config
 from messunjerr.settings import get_settings
+
+# Тяжёлые импорты (alembic, SQLAlchemy, uvicorn, arq) лежат внутри команд: `healthcheck` и
+# `worker --check` запускаются Docker'ом каждые секунды и должны стартовать быстро.
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -36,12 +35,18 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _db_init(_: argparse.Namespace) -> int:
+    from messunjerr.core.dbinit import init_database, plan_from_settings
+
     asyncio.run(init_database(plan_from_settings(get_settings())))
     print("db-init: роли и база готовы")
     return 0
 
 
 def _migrate(_: argparse.Namespace) -> int:
+    from alembic import command
+
+    from messunjerr.core.migrations import alembic_config
+
     command.upgrade(alembic_config(), "head")
     print("migrate: схема на последней ревизии")
     return 0
@@ -63,10 +68,11 @@ def _healthcheck(args: argparse.Namespace) -> int:
 
 def _worker(args: argparse.Namespace) -> int:
     """Воркер фоновых задач (arq): один процесс на очередь."""
-    from messunjerr.jobs.worker import run_worker, worker_is_alive  # arq нужен только воркеру
-
     queue: str = args.queue
     if args.check:
+        # Лёгкий модуль: проверка идёт каждые секунды и не должна тянуть arq и всё приложение.
+        from messunjerr.jobs.health import worker_is_alive
+
         redis_url = get_settings().redis_url.get_secret_value()
         return 0 if asyncio.run(worker_is_alive(queue, redis_url)) else 1
     if args.reload:
@@ -79,6 +85,8 @@ def _worker(args: argparse.Namespace) -> int:
             target_type="command",
         )
         return 0
+    from messunjerr.jobs.worker import run_worker  # arq нужен только воркеру
+
     asyncio.run(run_worker(queue))
     return 0
 

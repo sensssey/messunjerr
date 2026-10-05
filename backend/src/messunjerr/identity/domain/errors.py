@@ -45,6 +45,39 @@ def token_invalid_or_expired() -> DomainError:
     )
 
 
+def refresh_missing() -> DomainError:
+    return DomainError(ErrorCode.REFRESH_MISSING, "The refresh cookie is missing.")
+
+
+def refresh_invalid() -> DomainError:
+    return DomainError(ErrorCode.REFRESH_INVALID, "The refresh token is unknown or revoked.")
+
+
+def refresh_expired() -> DomainError:
+    return DomainError(ErrorCode.REFRESH_EXPIRED, "The refresh token has expired.")
+
+
+def refresh_reused() -> DomainError:
+    return DomainError(
+        ErrorCode.REFRESH_REUSED,
+        "The refresh token was used again after rotation; the session has been revoked.",
+    )
+
+
+def reauth_failed() -> DomainError:
+    return DomainError(ErrorCode.REAUTH_FAILED, "The password is incorrect.")
+
+
+def service_unavailable(detail: str) -> DomainError:
+    return DomainError(ErrorCode.SERVICE_UNAVAILABLE, detail, headers={"Retry-After": "5"})
+
+
+def not_found(
+    detail: str = "The resource does not exist or is not available to you.",
+) -> DomainError:
+    return DomainError(ErrorCode.NOT_FOUND, detail)
+
+
 def unauthorized(code: ErrorCode, detail: str) -> DomainError:
     """`401` с заголовком `WWW-Authenticate` (RFC 6750): без токена только схема, иначе ошибка."""
     challenge = _BEARER if code is ErrorCode.TOKEN_MISSING else f'{_BEARER} error="invalid_token"'

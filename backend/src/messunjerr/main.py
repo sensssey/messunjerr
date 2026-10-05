@@ -1,7 +1,8 @@
 """Фабрика ASGI-приложения: `uvicorn messunjerr.main:create_app --factory`."""
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import cast
 
 from fastapi import FastAPI
@@ -15,6 +16,7 @@ from messunjerr.core.middleware import RequestContextMiddleware, RequestGuardMid
 from messunjerr.core.migrations import expected_head
 from messunjerr.core.openapi import install_openapi
 from messunjerr.core.problems import install_problem_handlers
+from messunjerr.core.ratelimit import BucketConfig, RateLimiter, load_buckets
 from messunjerr.core.redis import create_redis
 from messunjerr.identity.api.routers import api_router as identity_api_router
 from messunjerr.identity.api.routers import well_known_router
@@ -42,7 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     injected: JobQueue | None = app.state.job_queue
     arq_queue = ArqJobQueue(settings.redis_url.get_secret_value()) if injected is None else None
     jobs: JobQueue = injected if injected is not None else cast(ArqJobQueue, arq_queue)
-    identity = await create_identity_services(settings)
+    identity = await create_identity_services(settings, redis)
     app.state.identity = identity
     app.state.resources = AppResources(
         settings=settings,
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         sessionmaker=create_sessionmaker(engine),
         redis=redis,
         jobs=jobs,
+        limiter=RateLimiter(redis, app.state.rate_limits, enabled=settings.rate_limits_enabled),
         expected_head=expected_head(),
     )
     log.info("startup", env=settings.app_env, version=__version__, build=settings.app_build)
@@ -64,10 +67,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         log.info("shutdown")
 
 
-def create_app(settings: Settings | None = None, *, job_queue: JobQueue | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    job_queue: JobQueue | None = None,
+    rate_limits: Mapping[str, BucketConfig] | None = None,
+) -> FastAPI:
+    """Собирает приложение. `job_queue` и `rate_limits` подставляют тесты; иначе arq и ratelimits.toml."""
     settings = settings or get_settings()
     check_runtime(settings)
     configure_logging(settings.log_level, settings.log_format)
+    # Ошибка в файле лимитов останавливает старт, а не всплывает на первом запросе.
+    buckets = (
+        dict(rate_limits)
+        if rate_limits is not None
+        else load_buckets(Path(settings.rate_limits_file) if settings.rate_limits_file else None)
+    )
 
     app = FastAPI(
         title="messunjerr API",
@@ -80,6 +95,7 @@ def create_app(settings: Settings | None = None, *, job_queue: JobQueue | None =
     )
     app.state.settings = settings
     app.state.job_queue = job_queue
+    app.state.rate_limits = buckets
 
     install_problem_handlers(app)
     # Порядок: последний добавленный стоит снаружи, поэтому контекст запроса оборачивает защиту.
