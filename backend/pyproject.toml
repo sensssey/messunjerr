@@ -24,6 +24,8 @@ dependencies = [
     "arq>=0.28,<0.29",
     "aiosmtplib>=5,<6",
     "jinja2>=3.1,<4",
+    # S3: проверка часовых поясов IANA не должна зависеть от системных файлов образа
+    "tzdata>=2025.2",
 ]
 
 [project.scripts]
@@ -107,7 +109,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests_v2/**" = ["S101", "S105", "S106", "S311", "PLR2004", "FBT003"]
+"tests_v2/**" = ["S101", "S105", "S106", "S311", "S608", "PLR2004", "FBT003"]
 "migrations/**" = ["S608", "N999"]
 "src/messunjerr/core/dbinit.py" = ["S608"]
 "src/messunjerr/cli.py" = ["T201"]  # командная строка печатает результат в stdout

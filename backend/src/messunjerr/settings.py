@@ -138,6 +138,15 @@ class Settings(BaseSettings):
     legal_operator_address: str | None = None
     legal_contact_email: str | None = None
 
+    # --- аккаунт: срок восстановления после запроса удаления (⚖️) и пауза между сменами ника
+    account_deletion_grace_days: int = Field(default=14, ge=1, le=90)
+    username_change_cooldown_days: int = Field(
+        default=30,
+        ge=0,
+        le=365,
+        description="пауза между сменами ника; столько же прежний ник остаётся занятым (5.3)",
+    )
+
     # --- почта: письма уходят фоновой задачей `send_email` (воркер), API её только ставит
     mail_transport: Literal["smtp"] = "smtp"
     smtp_url: SecretStr | None = None

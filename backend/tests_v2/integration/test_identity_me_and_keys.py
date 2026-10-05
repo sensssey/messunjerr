@@ -52,11 +52,23 @@ async def test_me_returns_the_current_user(
         "role",
         "status",
         "created_at",
+        "profile",
+        "privacy",
+        "counters",
+        "required_actions",
     }
     assert body["id"] == user.user_id
     assert body["email"] == user.credentials["email"]
     assert body["username"] == user.credentials["username"]
     assert (body["email_verified"], body["role"], body["status"]) == (True, "user", "active")
+    assert body["profile"]["display_name"] == user.credentials["username"]
+    assert body["counters"] == {
+        "unread_notifications": 0,
+        "unread_conversations": 0,
+        "pending_friend_requests": 0,
+        "pending_follow_requests": 0,
+    }
+    assert body["required_actions"] == []
 
 
 async def test_me_without_a_token_is_401_with_a_bearer_challenge(client: httpx.AsyncClient) -> None:
@@ -159,7 +171,7 @@ async def test_a_redis_outage_does_not_block_general_endpoints(
     async def unreachable(*args: Any, **kwargs: Any) -> int:
         raise ConnectionError("redis is down")
 
-    monkeypatch.setattr(app.state.resources.redis, "exists", unreachable)
+    monkeypatch.setattr(app.state.resources.redis, "mget", unreachable)
 
     assert (await client.get(ME, headers=user.headers)).status_code == 200
 

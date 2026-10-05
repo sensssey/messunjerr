@@ -31,6 +31,42 @@ layers =
     infra
     domain
 
+[importlinter:contract:profiles-layers]
+name = Внутри profiles: api, commands, queries, infra, domain
+type = layers
+containers =
+    messunjerr.profiles
+layers =
+    api
+    commands
+    queries
+    infra
+    domain
+
+# Контексты выше identity берут у него только публичный интерфейс (4.2, правило 1): зависимости
+# аутентификации, карточку аккаунта и порты. Модели, репозитории и команды identity им не видны.
+# Косвенные импорты разрешены: сам `api_public` стоит поверх внутренностей identity.
+[importlinter:contract:identity-public-interface]
+name = Другие контексты видят identity только через api_public
+type = forbidden
+source_modules =
+    messunjerr.profiles
+    messunjerr.social
+    messunjerr.content
+    messunjerr.chat
+    messunjerr.notifications
+    messunjerr.media
+    messunjerr.moderation
+    messunjerr.realtime
+forbidden_modules =
+    messunjerr.identity.api
+    messunjerr.identity.commands
+    messunjerr.identity.queries
+    messunjerr.identity.infra
+    messunjerr.identity.domain
+    messunjerr.identity.services
+allow_indirect_imports = True
+
 # Точки сборки (приложение, CLI, фоновые процессы) собирают контексты, но не наоборот.
 [importlinter:contract:roots]
 name = Ядро и контексты не импортируют точки сборки
@@ -49,6 +85,7 @@ source_modules =
 forbidden_modules =
     messunjerr.main
     messunjerr.cli
+    messunjerr.seeding
     messunjerr.system
     messunjerr.jobs
     messunjerr.consumers

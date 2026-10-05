@@ -9,8 +9,12 @@ MIB = 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class Limits:
+    display_name_max: int = 50
     bio_max: int = 500
+    city_max: int = 100
     links_max: int = 5
+    link_title_max: int = 40
+    link_url_max: int = 300
     post_body_max: int = 5000
     comment_body_max: int = 2000
     message_body_max: int = 4000

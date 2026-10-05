@@ -14,7 +14,11 @@ from sqlalchemy.pool import NullPool
 from messunjerr.core.db import SCHEMAS, Base
 
 # Модули с моделями регистрируют таблицы в Base.metadata; каждый новый контекст добавляется сюда.
-for module in ("messunjerr.core.models", "messunjerr.identity.infra.models"):
+for module in (
+    "messunjerr.core.models",
+    "messunjerr.identity.infra.models",
+    "messunjerr.profiles.infra.models",
+):
     import_module(module)
 
 config = context.config

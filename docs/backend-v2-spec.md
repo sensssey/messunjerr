@@ -303,7 +303,8 @@ flowchart TB
 1. Контексты обращаются друг к другу только через **публичный интерфейс** (`<context>/api_public.py`: функции запросов и порты) и **события**; модели и репозитории чужого контекста не импортируются.
 2. Циклы запрещены; направление зависимостей проверяет `import-linter` в CI.
 3. Базовые данные пользователя (`identity.users`) могут быть целью внешнего ключа из любого контекста; всё остальное связывается по идентификатору без обращения к чужим таблицам в обход публичного интерфейса.
-4. ⚖️ Каждый контекст, хранящий персональные данные, реализует порт `PersonalDataProvider` (`describe()`, `export(user_id)`, `erase(user_id)`) и регистрирует его в `core.pd_registry`. Контекст `compliance` вызывает порты через реестр и не импортирует чужие модули. Тест в CI обходит `information_schema` и падает, если найдена таблица со столбцом `user_id` (или `*_user_id`), которую не объявил ни один провайдер: забыть новую таблицу при экспорте и удалении нельзя (4.20).
+4. Если нижнему контексту нужны данные верхнего, он не импортирует его, а определяет порт (`Protocol`) в своём `infra/ports.py`; реализацию подставляет корень приложения (`main.py`). Так `identity` создаёт профиль при регистрации и берёт разделы `MeUser` у `profiles` (S3), так же придут счётчики друзей, уведомлений и бесед (S7, S10, S14). Общие модели ответа, которые собирают несколько контекстов (`MeUser`), лежат в `core/me.py`.
+5. ⚖️ Каждый контекст, хранящий персональные данные, реализует порт `PersonalDataProvider` (`describe()`, `export(user_id)`, `erase(user_id)`) и регистрирует его в `core.pd_registry`. Контекст `compliance` вызывает порты через реестр и не импортирует чужие модули. Тест в CI обходит `information_schema` и падает, если найдена таблица со столбцом `user_id` (или `*_user_id`), которую не объявил ни один провайдер: забыть новую таблицу при экспорте и удалении нельзя (4.20).
 
 ### 4.3. Слои: CQRS-lite, Unit of Work, outbox
 
@@ -481,6 +482,14 @@ CREATE TABLE identity.email_tokens (
     consumed_at timestamptz,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE identity.username_reservations (               -- прежний ник после смены (5.3): занят до reserved_until
+    username       citext PRIMARY KEY,
+    user_id        uuid NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    reserved_until timestamptz NOT NULL
+);
+CREATE INDEX ix_username_reservations_user_id ON identity.username_reservations (user_id);
+CREATE INDEX ix_username_reservations_reserved_until ON identity.username_reservations (reserved_until);
 
 CREATE TABLE profile.profiles (
     user_id               uuid PRIMARY KEY REFERENCES identity.users(id) ON DELETE CASCADE,
@@ -1028,7 +1037,7 @@ Cookie с `SameSite=Strict` не отправляется со сторонни�
 
 #### Что проверяет каждый запрос
 
-Подпись, `exp`, `iss`, `aud`, отсутствие `sid` в denylist, ограничение `scp` (токен `consent` допускается только на ручки из списка выше). Статус пользователя и роль из БД **не** читаются на каждый запрос: блокировка и бан отзывают все сессии и кладут их `sid` в denylist, а изменение роли действует после обновления токена (до 10 минут); админские ручки и операции из списка ниже перечитывают пользователя из БД. Если Redis недоступен: общие ручки работают без проверки denylist (с предупреждением в логах и метрикой), «чувствительные» (смена пароля и почты, удаление аккаунта, управление сессиями, модерация, админка) отвечают `503`.
+Подпись, `exp`, `iss`, `aud`, отсутствие `sid` в denylist, ограничение `scp` (токен `consent` допускается только на ручки из списка выше). Статус пользователя и роль из БД **не** читаются на каждый запрос: блокировка и бан отзывают все сессии и кладут их `sid` в denylist, а изменение роли действует после обновления токена (до 10 минут); админские ручки и операции из списка ниже перечитывают пользователя из БД. Аккаунт, который ждёт удаления, пускают только на `GET /me`, `POST /me/restore` и выход (`403 account_deletion_pending` на остальном, 5.1). Его статус тоже не читается из БД на каждый запрос: `DELETE /me` ставит в Redis признак `acct:deletion:{user_id}` (срок чуть больше срока access-токена), его читает та же команда `MGET`, что и denylist, а вход и `refresh` аккаунта в этом статусе признак подтверждают и продлевают; `POST /me/restore` его снимает. Если Redis недоступен: общие ручки работают без проверки denylist и признака (с предупреждением в логах и метрикой), «чувствительные» (смена пароля и почты, удаление аккаунта, управление сессиями, модерация, админка) отвечают `503`.
 
 #### Чувствительные операции
 
@@ -1306,6 +1315,7 @@ Redis хранит только эфемерное и очередь arq. Нас
 | `rl:{бакет}:{субъект}` | hash (Lua, token bucket) | окно бакета | лимиты запросов |
 | `ticket:{sha256}` | hash | 30 с, одноразовый | вход в WS и SSE |
 | `sess:revoked:{sid}` | string | 10 мин | отозванные сессии (denylist access-токенов) |
+| `acct:deletion:{user_id}` | string | срок токена + 5 мин, продлевается входом и `refresh` | аккаунт ждёт удаления: допускаются только `GET /me`, `POST /me/restore`, выход (4.7) |
 | `presence:last_seen` | ZSET `user_id → время` | без срока (чистится подметалкой) | присутствие |
 | `chan:chat:{conversation_id}` | pub/sub | — | события беседы между инстансами |
 | `chan:user:{user_id}` | pub/sub | — | события пользователя для SSE и команды управления (`session.revoked`) |
@@ -2032,7 +2042,7 @@ JWKS с публичными ключами Ed25519 (`kty: OKP`, `crv: Ed25519`,
 
 #### `PATCH /me/username` · токен
 
-Тело: `username`. Успех `200` `{ "username": "…" }`. Ограничение: не чаще раза в 30 дней, первая смена бесплатна. Ошибки: `409 username_taken` · `409 username_change_cooldown` (расширение `retry_after_days`) · `422 username_reserved`. Старый ник освобождается через 30 дней.
+Тело: `username`. Успех `200` `{ "username": "…" }`. Ограничение: не чаще раза в 30 дней, первая смена бесплатна. Ошибки: `409 username_taken` · `409 username_change_cooldown` (расширение `retry_after_days`) · `422 username_reserved`. Старый ник освобождается через 30 дней: пока он зарезервирован (`identity.username_reservations`), его не займёт никто, ни смена ника, ни регистрация, а `GET /auth/username-available` отвечает `taken`. Срок настраивается (`USERNAME_CHANGE_COOLDOWN_DAYS`).
 
 #### `GET /me/privacy`, `PATCH /me/privacy` · токен
 
@@ -2902,7 +2912,8 @@ Ticket одноразовый и живёт 30 секунд; новое подк
 {
   "version": "1.0.0", "build": "3f9a1c2", "server_time": "2026-10-04T12:34:56.789Z",
   "limits": {
-    "bio_max": 500, "links_max": 5, "post_body_max": 5000, "comment_body_max": 2000, "message_body_max": 4000,
+    "display_name_max": 50, "bio_max": 500, "city_max": 100, "links_max": 5, "link_title_max": 40, "link_url_max": 300,
+    "post_body_max": 5000, "comment_body_max": 2000, "message_body_max": 4000,
     "post_media_max": 10, "message_attachments_max": 10, "group_members_max": 100,
     "avatar_max_bytes": 5242880, "image_max_bytes": 10485760, "file_max_bytes": 26214400, "quota_bytes": 1073741824,
     "message_edit_window_hours": 48
@@ -3138,6 +3149,7 @@ Ticket одноразовый и живёт 30 секунд; новое подк
 | `REDIS_MAX_CONNECTIONS`, `REDIS_POOL_TIMEOUT_SECONDS` | `50`, `2` | пул соединений с Redis ждёт свободного соединения; ожидание дольше таймаута считается сбоем Redis |
 | `MIN_AGE` | `18` | ⚖️ минимальный возраст |
 | `ACCOUNT_DELETION_GRACE_DAYS` | `14` | ⚖️ срок восстановления аккаунта до уничтожения |
+| `USERNAME_CHANGE_COOLDOWN_DAYS` | `30` | пауза между сменами ника; столько же прежний ник остаётся занятым (5.3) |
 | `IP_RETENTION_DAYS` | `90` | ⚖️ срок хранения IP и User-Agent в сессиях, согласиях и аудите |
 | `AUDIT_RETENTION_DAYS` | `365` | ⚖️ |
 | `NOTIFICATION_RETENTION_DAYS` | `180` | ⚖️ |

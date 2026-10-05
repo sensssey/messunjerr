@@ -13,7 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from messunjerr.core.idempotency import purge_expired_keys
 from messunjerr.core.logs import get_logger
 from messunjerr.core.mail import Mailer, PermanentMailError, TransientMailError, render_email
-from messunjerr.identity.commands.housekeeping import purge_spent_tokens, purge_unverified_accounts
+from messunjerr.identity.commands.housekeeping import (
+    purge_spent_tokens,
+    purge_unverified_accounts,
+    purge_username_reservations,
+)
 from messunjerr.settings import Settings
 
 SEND_EMAIL_MAX_TRIES = 5
@@ -71,16 +75,18 @@ async def cleanup_unverified_accounts(ctx: dict[str, Any]) -> int:
 
 
 async def cleanup_tokens_and_idempotency(ctx: dict[str, Any]) -> dict[str, int]:
-    """Удаляет токены из писем и записи `Idempotency-Key`, срок которых вышел."""
+    """Удаляет токены из писем, записи `Idempotency-Key` и резервы прежних ников, срок которых вышел."""
     sessionmaker = cast("async_sessionmaker[AsyncSession]", ctx["sessionmaker"])
     removed = {
         "email_tokens": await purge_spent_tokens(sessionmaker),
         "idempotency_keys": await purge_expired_keys(sessionmaker),
+        "username_reservations": await purge_username_reservations(sessionmaker),
     }
     # Ключ `email_tokens` фильтр журнала принял бы за секрет и скрыл: пишем под другим именем.
     get_logger("messunjerr.jobs.cleanup").info(
         "cleanup_tokens_and_idempotency",
         mail_links=removed["email_tokens"],
         idempotency_keys=removed["idempotency_keys"],
+        username_reservations=removed["username_reservations"],
     )
     return removed

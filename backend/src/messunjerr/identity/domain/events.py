@@ -25,7 +25,14 @@ class PasswordChanged:
     user_id: uuid.UUID
 
 
-type UserEvent = UserRegistered | EmailVerified | PasswordChanged
+@dataclass(frozen=True, slots=True)
+class UserDeletionRequested:
+    """Человек запросил удаление аккаунта (S3-06); уничтожение данных делает S18 по сроку из БД."""
+
+    user_id: uuid.UUID
+
+
+type UserEvent = UserRegistered | EmailVerified | PasswordChanged | UserDeletionRequested
 
 
 def record(outbox: Outbox, event: UserEvent) -> None:

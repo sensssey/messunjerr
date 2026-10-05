@@ -181,6 +181,23 @@ async def send_password_changed_notice(
     )
 
 
+async def send_deletion_requested_notice(
+    *, jobs: JobQueue, settings: Settings, user: UserRow, scheduled_at: datetime
+) -> None:
+    """Письмо о запросе удаления: когда данные будут стёрты и как передумать. Лучшее усилие, после коммита."""
+    await enqueue_email(
+        jobs,
+        to=user.email,
+        template="account_deletion_requested",
+        context={
+            "scheduled_at": scheduled_at.strftime("%d.%m.%Y %H:%M UTC"),
+            "grace_days": settings.account_deletion_grace_days,
+            "login_url": f"{settings.base_url}/login",
+            "reset_url": f"{settings.base_url}/forgot-password",
+        },
+    )
+
+
 async def send_refresh_reuse_notice(
     *, jobs: JobQueue, settings: Settings, user: UserRow, device: str | None
 ) -> None:

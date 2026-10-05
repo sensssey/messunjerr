@@ -1,5 +1,6 @@
 """Фабрика ASGI-приложения: `uvicorn messunjerr.main:create_app --factory`."""
 
+import asyncio
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi import FastAPI
 from messunjerr import __version__
 from messunjerr.core.db import create_engine, create_sessionmaker
 from messunjerr.core.deps import AppResources
+from messunjerr.core.fields import warm_up_timezones
 from messunjerr.core.jobs import JobQueue
 from messunjerr.core.logs import configure_logging, get_logger
 from messunjerr.core.middleware import RequestContextMiddleware, RequestGuardMiddleware
@@ -22,6 +24,8 @@ from messunjerr.identity.api.routers import api_router as identity_api_router
 from messunjerr.identity.api.routers import well_known_router
 from messunjerr.identity.services import create_identity_services
 from messunjerr.jobs.queue import ArqJobQueue
+from messunjerr.profiles.api.routers import api_router as profiles_api_router
+from messunjerr.profiles.services import create_profile_services
 from messunjerr.settings import Settings, check_runtime, get_settings
 from messunjerr.system import api_router, health_router
 
@@ -38,14 +42,23 @@ DESCRIPTION = """Бэкенд messunjerr v2: соцсеть с чатом.
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings: Settings = app.state.settings
     log = get_logger("messunjerr.lifespan")
+    # База часовых поясов читается один раз при старте, а не на первом запросе с `timezone`.
+    await asyncio.to_thread(warm_up_timezones)
     engine = create_engine(settings)
     redis = create_redis(settings)
     # Тесты подставляют свою очередь; иначе работает arq (соединение с Redis создаётся лениво).
     injected: JobQueue | None = app.state.job_queue
     arq_queue = ArqJobQueue(settings.redis_url.get_secret_value()) if injected is None else None
     jobs: JobQueue = injected if injected is not None else cast(ArqJobQueue, arq_queue)
-    identity = await create_identity_services(settings, redis)
+    # Порты профилей к медиа, графу и контенту пока заглушки: настоящие подставят S6, S7–S8, S11.
+    profiles = create_profile_services()
+    # identity ниже profiles в графе контекстов (4.2): создание профиля при регистрации и разделы
+    # `MeUser` ему приносят порты, которые реализуют профили.
+    identity = await create_identity_services(
+        settings, redis, me_extras=profiles, provisioner=profiles
+    )
     app.state.identity = identity
+    app.state.profiles = profiles
     app.state.resources = AppResources(
         settings=settings,
         engine=engine,
@@ -110,5 +123,6 @@ def create_app(
     app.include_router(well_known_router)
     app.include_router(api_router)
     app.include_router(identity_api_router)
+    app.include_router(profiles_api_router)
     install_openapi(app)
     return app

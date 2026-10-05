@@ -104,6 +104,28 @@ class SessionRow(Base):
     device_label: Mapped[str | None] = mapped_column(Text)
 
 
+class UsernameReservationRow(Base):
+    """Прежний ник после смены (5.3): `reserved_until` другие его взять не могут (S3-03).
+
+    Таблицы нет в DDL 4.5: там сказано «старый ник освобождается через 30 дней», а где это хранить,
+    не сказано. Запись живёт столько же, сколько пауза между сменами; просроченные строки удаляет
+    плановая очистка, а до неё они просто не учитываются.
+    """
+
+    __tablename__ = "username_reservations"
+    __table_args__ = (
+        Index("ix_username_reservations_user_id", "user_id"),
+        Index("ix_username_reservations_reserved_until", "reserved_until"),
+        {"schema": IDENTITY_SCHEMA},
+    )
+
+    username: Mapped[str] = mapped_column(CITEXT, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey(f"{IDENTITY_SCHEMA}.users.id", ondelete="CASCADE")
+    )
+    reserved_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class EmailTokenRow(Base):
     """Одноразовый токен из письма: подтверждение почты, сброс пароля, смена почты."""
 

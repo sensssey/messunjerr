@@ -11,7 +11,6 @@ from datetime import datetime
 
 from messunjerr.core.audit import record_audit
 from messunjerr.core.clock import utcnow
-from messunjerr.core.codes import ErrorCode
 from messunjerr.core.ratelimit import RateLimiter
 from messunjerr.core.security import hash_token
 from messunjerr.core.uow import UnitOfWork
@@ -21,7 +20,7 @@ from messunjerr.identity.commands.common import (
     verify_reauth,
 )
 from messunjerr.identity.domain import audit
-from messunjerr.identity.domain.errors import not_found, unauthorized
+from messunjerr.identity.domain.errors import not_found, token_user_gone
 from messunjerr.identity.infra.password_service import PasswordService
 from messunjerr.identity.infra.repositories import SessionRepository, UserRepository
 from messunjerr.identity.infra.session_denylist import SessionDenylist
@@ -86,7 +85,7 @@ async def logout_all(
     moment = now or utcnow()
     user = await UserRepository(uow.session).get_by_id(actor.user_id, for_update=True)
     if user is None:
-        raise unauthorized(ErrorCode.TOKEN_INVALID, "The user of this token no longer exists.")
+        raise token_user_gone()
     await verify_reauth(
         uow=uow, user=user, password=password, passwords=passwords, limiter=limiter, client=client
     )

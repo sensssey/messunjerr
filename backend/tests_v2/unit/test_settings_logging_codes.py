@@ -254,7 +254,7 @@ def project_copy(tmp_path: Path) -> Path:
 def test_project_respects_import_contracts(project_copy: Path) -> None:
     result = _lint_imports(project_copy)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 3 kept, 0 broken" in result.stdout
+    assert "Contracts: 5 kept, 0 broken" in result.stdout
 
 
 def test_lower_context_importing_higher_context_breaks_the_build(project_copy: Path) -> None:
@@ -285,9 +285,82 @@ def test_layers_inside_a_context_cannot_import_upwards(
     assert "BROKEN" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("layer", "module"),
+    [
+        ("commands", "messunjerr.profiles.api.schemas"),
+        ("queries", "messunjerr.profiles.commands.update_profile"),
+        ("domain", "messunjerr.profiles.infra.models"),
+        ("infra", "messunjerr.profiles.queries.me"),
+    ],
+)
+def test_layers_inside_profiles_cannot_import_upwards(
+    project_copy: Path, layer: str, module: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / "profiles" / layer / "violation.py").write_text(
+        f"import {module}\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "messunjerr.identity.infra.models",  # модели чужого контекста не импортируем
+        "messunjerr.identity.commands.common",
+        "messunjerr.identity.queries.accounts",
+        "messunjerr.identity.api.deps",  # зависимости берём из api_public, а не напрямую
+        "messunjerr.identity.domain.errors",
+        "messunjerr.identity.services",
+    ],
+)
+def test_a_higher_context_may_reach_identity_only_through_its_public_interface(
+    project_copy: Path, module: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / "profiles" / "violation.py").write_text(
+        f"import {module}\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+    assert "api_public" in result.stdout
+
+
+def test_the_public_interface_of_identity_is_importable_from_higher_contexts(
+    project_copy: Path,
+) -> None:
+    (project_copy / "src" / "messunjerr" / "profiles" / "fine.py").write_text(
+        "from messunjerr.identity.api_public import PrincipalDep, find_account\n",
+        encoding="utf-8",
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_core_importing_an_entry_point_breaks_the_build(project_copy: Path) -> None:
     (project_copy / "src" / "messunjerr" / "core" / "violation.py").write_text(
         "from messunjerr import main\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize("context", ["core", "identity", "profiles"])
+def test_no_context_may_import_the_seeding_entry_point(project_copy: Path, context: str) -> None:
+    (project_copy / "src" / "messunjerr" / context / "violation.py").write_text(
+        "from messunjerr import seeding\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+def test_identity_cannot_import_profiles_it_uses_ports_instead(project_copy: Path) -> None:
+    (project_copy / "src" / "messunjerr" / "identity" / "violation.py").write_text(
+        "from messunjerr.profiles import services\n", encoding="utf-8"
     )
     result = _lint_imports(project_copy)
     assert result.returncode != 0

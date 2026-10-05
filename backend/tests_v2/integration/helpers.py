@@ -187,6 +187,18 @@ async def limited_client(
             yield application, http
 
 
+@asynccontextmanager
+async def client_with(
+    test_settings: Settings, jobs: InMemoryJobQueue, **overrides: Any
+) -> AsyncGenerator[httpx.AsyncClient]:
+    """Приложение с другими настройками (`min_age`, паузой смены ника и т.п.); лимиты остаются выключены."""
+    application = create_app(test_settings.model_copy(update=overrides), job_queue=jobs)
+    async with LifespanManager(application):
+        transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            yield http
+
+
 async def register(
     client: httpx.AsyncClient, **overrides: Any
 ) -> tuple[httpx.Response, dict[str, Any]]:
@@ -204,3 +216,46 @@ async def verified_user(
     verify = await client.post("/api/v1/auth/verify-email", json={"token": token})
     assert verify.status_code == 200, verify.text
     return SignedInUser(credentials=body, auth=verify.json(), response=verify)
+
+
+# ----------------------------------------------------------------------------- профили (S3)
+def url(ref: str) -> str:
+    return f"/api/v1/users/{ref}"
+
+
+async def fill_profile(
+    client: httpx.AsyncClient, user: SignedInUser, **overrides: Any
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "display_name": "Анна",
+        "bio": "Люблю горы",
+        "links": [{"title": "Блог", "url": "https://example.com"}],
+        "birth_date": "1990-05-12",
+        "birth_date_visibility": "full",
+        "city": "Казань",
+        "language": "ru",
+        "timezone": "Europe/Moscow",
+    }
+    body.update(overrides)
+    response = await client.patch("/api/v1/me/profile", json=body, headers=user.headers)
+    assert response.status_code == 200, response.text
+    profile: dict[str, Any] = response.json()
+    return profile
+
+
+async def set_privacy(client: httpx.AsyncClient, user: SignedInUser, **body: Any) -> None:
+    response = await client.patch("/api/v1/me/privacy", json=body, headers=user.headers)
+    assert response.status_code == 200, response.text
+
+
+async def view(client: httpx.AsyncClient, viewer: SignedInUser, ref: str) -> httpx.Response:
+    return await client.get(url(ref), headers=viewer.headers)
+
+
+async def two_users(
+    client: httpx.AsyncClient, jobs: InMemoryJobQueue, **owner_profile: Any
+) -> tuple[SignedInUser, SignedInUser]:
+    owner = await verified_user(client, jobs)
+    await fill_profile(client, owner, **owner_profile)
+    viewer = await verified_user(client, jobs)
+    return owner, viewer

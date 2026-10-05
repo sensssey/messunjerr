@@ -258,7 +258,7 @@ npm start               # http://localhost:3000
 
 ## Разработка v2 (Docker)
 
-Новый бэкенд растёт рядом со старым, в `backend/src/messunjerr/`; порядок работ описан в [плане спринтов](docs/backend-v2-sprints.md). Сделаны **спринт 0** (фундамент: миграции, тесты, CI), **спринт 1** (регистрация, подтверждение почты, вход) и **спринт 2** (сессии, пароли, лимиты): `POST /auth/register`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/login`, `/auth/refresh` (ротация refresh-токена с обнаружением повторного использования), `/auth/logout`, `/auth/logout-all`, `GET /auth/sessions`, `DELETE /auth/sessions/{id}`, `/auth/password/forgot`, `/reset`, `/change`, `/auth/email/change`, `/confirm`, `GET /auth/username-available`, `GET /me`, `GET /legal/documents`, `GET /.well-known/jwks.json`. Лимиты запросов (token bucket в Redis, заголовки `RateLimit-*`), журнал аудита и `Idempotency-Key` для будущих создающих ручек уже работают. Письма отправляет воркер `worker` (очередь `email`, arq), плановую очистку (неподтверждённые аккаунты, просроченные токены и ключи) делает `worker-default`; в разработке письма оседают в Mailpit. Профили появятся в спринте 3. Весь план собирается и работает локально; выход в мир (VPS, домен, вход через VK ID и Яндекс ID) вынесен в последний спринт S21.
+Новый бэкенд растёт рядом со старым, в `backend/src/messunjerr/`; порядок работ описан в [плане спринтов](docs/backend-v2-sprints.md). Сделаны **спринт 0** (фундамент: миграции, тесты, CI), **спринт 1** (регистрация, подтверждение почты, вход), **спринт 2** (сессии, пароли, лимиты) и **спринт 3** (профили и приватность): `POST /auth/register`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/login`, `/auth/refresh` (ротация refresh-токена с обнаружением повторного использования), `/auth/logout`, `/auth/logout-all`, `GET /auth/sessions`, `DELETE /auth/sessions/{id}`, `/auth/password/forgot`, `/reset`, `/change`, `/auth/email/change`, `/confirm`, `GET /auth/username-available`, `GET /me`, `GET /legal/documents`, `GET /.well-known/jwks.json`; из спринта 3: `PATCH /me/profile`, `GET` и `PATCH /me/privacy`, `PATCH /me/username` (раз в 30 дней, прежний ник ещё 30 дней занят), `DELETE /me` и `POST /me/restore` (удаление с 14 днями на передумать; пока аккаунт ждёт удаления, доступны только `GET /me`, восстановление и выход), `GET /users/{ref}` (профиль глазами зрителя: закрытый профиль, видимость даты рождения и счётчиков по настройкам владельца). `GET /me` и ответы входа отдают профиль, настройки приватности и счётчики. Лимиты запросов (token bucket в Redis, заголовки `RateLimit-*`), журнал аудита и `Idempotency-Key` для будущих создающих ручек уже работают. Письма отправляет воркер `worker` (очередь `email`, arq), плановую очистку (неподтверждённые аккаунты, просроченные токены и ключи) делает `worker-default`; в разработке письма оседают в Mailpit. Весь план собирается и работает локально; выход в мир (VPS, домен, вход через VK ID и Яндекс ID) вынесен в последний спринт S21.
 
 Нужны Docker с Compose v2 и Python 3 (только чтобы один раз сгенерировать пароли и ключ подписи токенов). На Windows `make` не обязателен: `./dev.ps1 <команда>` делает то же самое.
 
@@ -267,6 +267,7 @@ make init     # deploy/.env со случайными паролями и клю
 make up       # PostgreSQL 18, Redis, Mailpit, API и воркеры; роли и миграции применяются сами
 make test     # unit и интеграционные тесты на настоящих PostgreSQL, Redis и Mailpit
 make check    # всё, что проверяет CI: ruff, pyright (strict), import-linter, тесты
+make seed     # учебные аккаунты seed_0001… с разными профилями (открытые и закрытые, приватность вразнобой); повтор безопасен
 ```
 
 | Адрес | Что там |
@@ -276,7 +277,7 @@ make check    # всё, что проверяет CI: ruff, pyright (strict), im
 | http://localhost:8025 | Mailpit: письма, которые «отправляет» приложение (там же токен подтверждения почты) |
 | `127.0.0.1:54320`, `127.0.0.1:63790` | PostgreSQL и Redis для клиентов вроде psql и DBeaver; пароли в `deploy/.env` |
 
-Сценарий «регистрация → письмо → подтверждение → вход → `GET /me`» собран в [backend/http/auth.http](backend/http/auth.http) для HTTP-клиента JetBrains: токен из письма он достаёт из Mailpit сам. Сессии, ротация и повторное использование refresh-токена, «выйти везде», сброс и смена пароля, смена почты и лимиты: [backend/http/auth-sessions.http](backend/http/auth-sessions.http).
+Сценарий «регистрация → письмо → подтверждение → вход → `GET /me`» собран в [backend/http/auth.http](backend/http/auth.http) для HTTP-клиента JetBrains: токен из письма он достаёт из Mailpit сам. Сессии, ротация и повторное использование refresh-токена, «выйти везде», сброс и смена пароля, смена почты и лимиты: [backend/http/auth-sessions.http](backend/http/auth-sessions.http). Профили, приватность, смена ника, удаление и восстановление аккаунта: [backend/http/profile.http](backend/http/profile.http). Что менялось в контракте API, записано в [журнале изменений](docs/api-changelog.md).
 
 Порты выбраны так, чтобы не пересекаться со стеком v0.1 (`1221`, `3245`, `1337`) и с обычными PostgreSQL (`5432`) и Redis (`6379`) на машине. Исходники правятся на хосте, uvicorn в контейнере перезапускается сам. Тесты используют те же сервисы Compose (в CI это сервисы GitHub Actions), каждый прогон создаёт свою временную базу `mj_test_*`, поэтому данные разработки не затрагиваются.
 
@@ -410,7 +411,7 @@ messunjerr/
 - [ ] CI на GitHub Actions: тесты и линтеры
 - [ ] Production-сборка клиента (nginx, HTTPS)
 - [x] Ограничение частоты запросов, refresh-токены (в новом бэкенде v2, спринт 2)
-- [ ] Переход на целевую архитектуру v2 по [спецификации](docs/backend-v2-spec.md): PostgreSQL 18, Redis, Kafka, Caddy, SeaweedFS, соответствие 152-ФЗ. Идёт по [плану спринтов](docs/backend-v2-sprints.md): спринты 0 (фундамент), 1 (регистрация и вход) и 2 (сессии, пароли, лимиты) готовы, дальше спринт 3 (профили и приватность). Всё собирается и работает локально, выход в мир (VPS, домен, вход через VK ID и Яндекс ID) в последнем спринте S21
+- [ ] Переход на целевую архитектуру v2 по [спецификации](docs/backend-v2-spec.md): PostgreSQL 18, Redis, Kafka, Caddy, SeaweedFS, соответствие 152-ФЗ. Идёт по [плану спринтов](docs/backend-v2-sprints.md): спринты 0 (фундамент), 1 (регистрация и вход), 2 (сессии, пароли, лимиты) и 3 (профили и приватность) готовы, дальше спринт 4 (prod-подобный стенд). Всё собирается и работает локально, выход в мир (VPS, домен, вход через VK ID и Яндекс ID) в последнем спринте S21
 
 ## Автор
 

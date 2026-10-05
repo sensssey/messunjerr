@@ -49,10 +49,10 @@ def break_redis(monkeypatch: pytest.MonkeyPatch, app: FastAPI) -> None:
     """Redis «недоступен» для проверки отозванных сессий."""
     services: IdentityServices = app.state.identity
 
-    async def unreachable(session_id: Any) -> bool:
+    async def unreachable(*args: Any, **kwargs: Any) -> bool:
         raise ConnectionError("redis is down")
 
-    monkeypatch.setattr(services.denylist, "is_revoked", unreachable)
+    monkeypatch.setattr(services.denylist, "access_state", unreachable)
 
 
 # ----------------------------------------------------------------------------- logout

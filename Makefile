@@ -24,7 +24,7 @@ m ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help init up down restart reset ps logs test test-unit lint format typecheck arch check \
-	migrate db-check revision psql redis-cli shell lock
+	migrate db-check revision seed psql redis-cli shell lock
 
 help: ## Показать команды
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-11s %s\n", $$1, $$2}'
@@ -81,6 +81,9 @@ db-check: ## alembic check: модели и миграции не расходя
 revision: ## Новая миграция по моделям: make revision m="описание"
 	@test -n "$(m)" || (echo 'Укажите описание: make revision m="add users"'; exit 1)
 	$(TOOLS) alembic revision --autogenerate -m "$(m)"
+
+seed: ## Учебные аккаунты с профилями (make seed ARGS="--users 100"), повтор безопасен
+	$(TOOLS) python -m messunjerr seed $(ARGS)
 
 psql: ## psql в базе разработки (суперпользователь)
 	$(COMPOSE) exec postgres psql -U postgres -d $(DB_NAME)

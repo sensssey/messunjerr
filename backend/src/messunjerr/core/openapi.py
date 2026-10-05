@@ -30,6 +30,18 @@ def problem_responses(*codes: ErrorCode) -> ResponsesDict:
     return result
 
 
+TOKEN_ERRORS = problem_responses(
+    ErrorCode.TOKEN_MISSING,
+    ErrorCode.TOKEN_INVALID,
+    ErrorCode.TOKEN_EXPIRED,
+    ErrorCode.SESSION_REVOKED,
+)
+"""Ошибки токена, общие для ручек с `Authorization: Bearer` (5.1)."""
+
+LIMIT_ERRORS = problem_responses(ErrorCode.RATE_LIMITED, ErrorCode.SERVICE_UNAVAILABLE)
+"""Ошибки лимитов запросов и недоступной зависимости (5.1)."""
+
+
 def install_openapi(app: FastAPI) -> None:
     """Добавляет в схему компонент `Problem`, на который ссылаются `problem_responses`."""
     original = app.openapi

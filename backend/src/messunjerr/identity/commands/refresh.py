@@ -27,6 +27,7 @@ from messunjerr.core.security import hash_token, new_opaque_token
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.identity.commands.common import (
     ClientInfo,
+    confirm_deletion_flag_after_commit,
     ensure_can_sign_in,
     revoke_in_denylist_after_commit,
 )
@@ -40,8 +41,10 @@ from messunjerr.identity.domain.errors import (
 )
 from messunjerr.identity.infra.jwt_service import TokenService
 from messunjerr.identity.infra.models import SessionRow, UserRow
+from messunjerr.identity.infra.ports import MeExtrasProvider
 from messunjerr.identity.infra.repositories import SessionRepository, UserRepository
 from messunjerr.identity.infra.session_denylist import SessionDenylist
+from messunjerr.identity.queries.me import build_me
 from messunjerr.identity.queries.models import MeUser
 from messunjerr.settings import Settings
 
@@ -94,6 +97,7 @@ async def refresh_session(
     uow: UnitOfWork,
     tokens: TokenService,
     denylist: SessionDenylist,
+    me_extras: MeExtrasProvider,
     limiter: RateLimiter,
     jobs: JobQueue,
     settings: Settings,
@@ -122,9 +126,11 @@ async def refresh_session(
             moment + timedelta(days=settings.refresh_ttl_days), session.absolute_expires_at
         )
         issued = tokens.issue(user_id=user.id, session_id=session.id, role=user.role, now=moment)
+        confirm_deletion_flag_after_commit(uow, denylist, user)
+        me = await build_me(uow.session, user, me_extras)
         await uow.commit()
         return Refreshed(
-            user=MeUser.from_row(user),
+            user=me,
             session_id=session.id,
             access_token=issued.token,
             expires_in=issued.expires_in,
@@ -144,9 +150,11 @@ async def refresh_session(
         # Две вкладки обновили токен почти одновременно: вторая получает только новый access.
         previous.last_seen_at = moment
         issued = tokens.issue(user_id=user.id, session_id=previous.id, role=user.role, now=moment)
+        confirm_deletion_flag_after_commit(uow, denylist, user)
+        me = await build_me(uow.session, user, me_extras)
         await uow.commit()
         return Refreshed(
-            user=MeUser.from_row(user),
+            user=me,
             session_id=previous.id,
             access_token=issued.token,
             expires_in=issued.expires_in,

@@ -63,6 +63,7 @@ function Show-Help {
   migrate     роли, база и миграции до последней ревизии
   db-check    alembic check: модели и миграции не расходятся
   revision    новая миграция по моделям: ./dev.ps1 revision "описание"
+  seed        учебные аккаунты с профилями (./dev.ps1 seed --users 100); повтор безопасен
   psql        psql в базе разработки (суперпользователь)
   redis-cli   redis-cli в Redis разработки
   shell       bash в контейнере с инструментами
@@ -115,6 +116,7 @@ switch ($Cmd) {
         }
         Invoke-Tools alembic revision --autogenerate -m ($Rest -join ' ')
     }
+    'seed' { Invoke-Tools python -m messunjerr seed @Rest }
     'psql' { Invoke-Compose exec postgres psql -U postgres -d (Get-EnvValue 'DB_NAME' 'messunjerr') }
     'redis-cli' { Invoke-Compose exec redis sh -c 'redis-cli -a $REDIS_PASSWORD --no-auth-warning' }
     'shell' { Invoke-Tools bash }

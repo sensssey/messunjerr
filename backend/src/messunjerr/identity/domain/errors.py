@@ -68,6 +68,31 @@ def reauth_failed() -> DomainError:
     return DomainError(ErrorCode.REAUTH_FAILED, "The password is incorrect.")
 
 
+def account_deletion_pending() -> DomainError:
+    return DomainError(
+        ErrorCode.ACCOUNT_DELETION_PENDING,
+        "The account is waiting for deletion: only GET /me, POST /me/restore and logout are allowed.",
+    )
+
+
+def not_pending_deletion(detail: str = "The account is not waiting for deletion.") -> DomainError:
+    return DomainError(ErrorCode.NOT_PENDING_DELETION, detail)
+
+
+def role_must_be_revoked() -> DomainError:
+    return DomainError(
+        ErrorCode.ROLE_MUST_BE_REVOKED,
+        "A moderator or administrator must give up the role before deleting the account.",
+    )
+
+
+def username_change_cooldown(retry_after_days: int) -> DomainError:
+    extensions: dict[str, Any] = {"retry_after_days": retry_after_days}
+    return DomainError(
+        ErrorCode.USERNAME_CHANGE_COOLDOWN, "The username was changed recently.", **extensions
+    )
+
+
 def service_unavailable(detail: str) -> DomainError:
     return DomainError(ErrorCode.SERVICE_UNAVAILABLE, detail, headers={"Retry-After": "5"})
 
@@ -82,3 +107,8 @@ def unauthorized(code: ErrorCode, detail: str) -> DomainError:
     """`401` с заголовком `WWW-Authenticate` (RFC 6750): без токена только схема, иначе ошибка."""
     challenge = _BEARER if code is ErrorCode.TOKEN_MISSING else f'{_BEARER} error="invalid_token"'
     return DomainError(code, detail, headers={"WWW-Authenticate": challenge})
+
+
+def token_user_gone() -> DomainError:
+    """Токен подписан нами, но пользователя уже нет (удалён): для клиента это то же, что неверный токен."""
+    return unauthorized(ErrorCode.TOKEN_INVALID, "The user of this token no longer exists.")

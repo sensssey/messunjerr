@@ -38,7 +38,7 @@ from messunjerr.identity.commands.mail import (
     send_password_changed_notice,
 )
 from messunjerr.identity.domain import audit
-from messunjerr.identity.domain.errors import token_invalid_or_expired, unauthorized
+from messunjerr.identity.domain.errors import token_invalid_or_expired, token_user_gone
 from messunjerr.identity.domain.events import EmailVerified, PasswordChanged, record
 from messunjerr.identity.domain.passwords import PasswordProblem, check_password_policy
 from messunjerr.identity.infra.models import UserRow
@@ -205,7 +205,7 @@ async def change_password(
     moment = now or utcnow()
     user = await UserRepository(uow.session).get_by_id(command.actor.user_id, for_update=True)
     if user is None:
-        raise unauthorized(ErrorCode.TOKEN_INVALID, "The user of this token no longer exists.")
+        raise token_user_gone()
     await verify_reauth(
         uow=uow,
         user=user,

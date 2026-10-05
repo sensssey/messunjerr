@@ -14,7 +14,7 @@ from messunjerr.core.codes import ErrorCode
 from messunjerr.core.csrf import require_csrf_guard
 from messunjerr.core.deps import ResourcesDep, UowDep
 from messunjerr.core.errors import DomainError
-from messunjerr.core.openapi import problem_responses
+from messunjerr.core.openapi import LIMIT_ERRORS, TOKEN_ERRORS, problem_responses
 from messunjerr.core.ratelimit_deps import client_ip, enforce, limit_by_ip, subject_digest
 from messunjerr.identity.api.cookies import (
     REFRESH_COOKIE,
@@ -25,6 +25,7 @@ from messunjerr.identity.api.cookies import (
 from messunjerr.identity.api.deps import (
     ClientDep,
     IdentityDep,
+    PrincipalAllowingDeletionDep,
     PrincipalDep,
     SensitivePrincipalDep,
     limit_user,
@@ -35,8 +36,11 @@ from messunjerr.identity.api.schemas import (
     AuthResponse,
     ChangeEmailRequest,
     ChangePasswordRequest,
+    ChangeUsernameRequest,
     ConfirmationSentResponse,
     ConfirmEmailRequest,
+    DeleteAccountRequest,
+    DeletionScheduledResponse,
     ForgotPasswordRequest,
     JwkResponse,
     JwksResponse,
@@ -51,8 +55,15 @@ from messunjerr.identity.api.schemas import (
     ResetPasswordRequest,
     SessionsResponse,
     UsernameAvailabilityResponse,
+    UsernameResponse,
     VerifyEmailRequest,
 )
+from messunjerr.identity.commands.account_deletion import (
+    RequestDeletion,
+    request_deletion,
+    restore_account,
+)
+from messunjerr.identity.commands.change_username import ChangeUsername, change_username
 from messunjerr.identity.commands.common import SignedIn
 from messunjerr.identity.commands.email_change import (
     RequestEmailChange,
@@ -72,7 +83,7 @@ from messunjerr.identity.commands.refresh import Refresh, refresh_session
 from messunjerr.identity.commands.register import RegisterUser, register_user
 from messunjerr.identity.commands.resend_verification import resend_verification_after_response
 from messunjerr.identity.commands.verify_email import VerifyEmail, verify_email
-from messunjerr.identity.domain.errors import unauthorized
+from messunjerr.identity.domain.errors import token_user_gone
 from messunjerr.identity.queries.me import check_username_available, get_me
 from messunjerr.identity.queries.models import MeUser
 from messunjerr.identity.queries.sessions import list_sessions
@@ -81,14 +92,6 @@ auth_router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(no_
 me_router = APIRouter(prefix="/me", tags=["me"], dependencies=[Depends(no_store)])
 legal_router = APIRouter(prefix="/legal", tags=["legal"])
 well_known_router = APIRouter(prefix="/.well-known", tags=["service"])
-
-_TOKEN_ERRORS = problem_responses(
-    ErrorCode.TOKEN_MISSING,
-    ErrorCode.TOKEN_INVALID,
-    ErrorCode.TOKEN_EXPIRED,
-    ErrorCode.SESSION_REVOKED,
-)
-_LIMIT_ERRORS = problem_responses(ErrorCode.RATE_LIMITED, ErrorCode.SERVICE_UNAVAILABLE)
 
 TERMS_TITLE = "Пользовательское соглашение и согласие на обработку персональных данных"
 _REFRESH_COOKIE_ERRORS = frozenset(
@@ -117,15 +120,16 @@ def _auth_response(response: Response, signed_in: SignedIn) -> AuthResponse:
     response_model=RegisterResponse,
     summary="Регистрация",
     description=(
-        "Создаёт аккаунт в статусе `pending` и отправляет письмо с токеном подтверждения. "
-        "Ответ одинаков, даже если адрес уже занят (тогда владельцу уходит письмо «вы уже "
-        "зарегистрированы»). ⚖️ Нужна галочка согласия `accept_terms`. Поля `display_name`, "
-        "`language` и `timezone` появятся вместе с профилем (S3). Лимит `auth_register_ip`."
+        "Создаёт аккаунт в статусе `pending` вместе с профилем и настройками приватности по "
+        "умолчанию и отправляет письмо с токеном подтверждения. Ответ одинаков, даже если адрес "
+        "уже занят (тогда владельцу уходит письмо «вы уже зарегистрированы»). Необязательные "
+        "`display_name` (по умолчанию ник), `language` и `timezone` попадают в профиль. "
+        "⚖️ Нужна галочка согласия `accept_terms`. Лимит `auth_register_ip`."
     ),
     dependencies=[Depends(limit_by_ip("auth_register_ip"))],
     responses={
         **problem_responses(ErrorCode.VALIDATION_ERROR, ErrorCode.USERNAME_TAKEN),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def register(
@@ -137,9 +141,13 @@ async def register(
             username=body.username,
             password=body.password,
             accept_terms=body.accept_terms,
+            display_name=body.display_name,
+            language=body.language,
+            timezone=body.timezone,
         ),
         uow=uow,
         passwords=identity.passwords,
+        provisioner=identity.provisioner,
         jobs=resources.jobs,
         settings=resources.settings,
     )
@@ -162,7 +170,7 @@ async def register(
             ErrorCode.ACCOUNT_BANNED,
             ErrorCode.VALIDATION_ERROR,
         ),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def verify_email_endpoint(
@@ -177,6 +185,8 @@ async def verify_email_endpoint(
         VerifyEmail(token=body.token, client=client),
         uow=uow,
         tokens=identity.tokens,
+        denylist=identity.denylist,
+        me_extras=identity.me_extras,
         settings=resources.settings,
     )
     return _auth_response(response, signed_in)
@@ -191,7 +201,7 @@ async def verify_email_endpoint(
         "Ответ `202` не зависит от того, есть ли адрес и подтверждён ли он. "
         "Лимиты `auth_email_ip` и `auth_email_addr`."
     ),
-    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **_LIMIT_ERRORS},
+    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **LIMIT_ERRORS},
 )
 async def resend_verification_endpoint(
     body: ResendVerificationRequest,
@@ -236,7 +246,7 @@ async def resend_verification_endpoint(
             ErrorCode.ACCOUNT_BANNED,
             ErrorCode.VALIDATION_ERROR,
         ),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def login_endpoint(
@@ -256,6 +266,8 @@ async def login_endpoint(
         uow=uow,
         passwords=identity.passwords,
         tokens=identity.tokens,
+        denylist=identity.denylist,
+        me_extras=identity.me_extras,
         limiter=resources.limiter,
         settings=resources.settings,
     )
@@ -283,7 +295,7 @@ async def login_endpoint(
             ErrorCode.ACCOUNT_SUSPENDED,
             ErrorCode.ACCOUNT_BANNED,
         ),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def refresh_endpoint(
@@ -300,6 +312,7 @@ async def refresh_endpoint(
             uow=uow,
             tokens=identity.tokens,
             denylist=identity.denylist,
+            me_extras=identity.me_extras,
             limiter=resources.limiter,
             jobs=resources.jobs,
             settings=resources.settings,
@@ -353,9 +366,9 @@ async def logout_endpoint(
     ),
     dependencies=[Depends(limit_user("api_write", sensitive=True))],
     responses={
-        **_TOKEN_ERRORS,
+        **TOKEN_ERRORS,
         **problem_responses(ErrorCode.REAUTH_FAILED, ErrorCode.VALIDATION_ERROR),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def logout_all_endpoint(
@@ -387,7 +400,7 @@ async def logout_all_endpoint(
     summary="Активные сессии",
     description="Действующие сессии пользователя; `current` отмечает ту, с которой сделан запрос.",
     dependencies=[Depends(limit_user("api_read", sensitive=True))],
-    responses={**_TOKEN_ERRORS, **_LIMIT_ERRORS},
+    responses={**TOKEN_ERRORS, **LIMIT_ERRORS},
 )
 async def sessions_endpoint(principal: SensitivePrincipalDep, uow: UowDep) -> SessionsResponse:
     items = await list_sessions(
@@ -409,7 +422,7 @@ async def sessions_endpoint(principal: SensitivePrincipalDep, uow: UowDep) -> Se
         "несуществующая сессии дают `404`."
     ),
     dependencies=[Depends(limit_user("api_write", sensitive=True))],
-    responses={**_TOKEN_ERRORS, **problem_responses(ErrorCode.NOT_FOUND), **_LIMIT_ERRORS},
+    responses={**TOKEN_ERRORS, **problem_responses(ErrorCode.NOT_FOUND), **LIMIT_ERRORS},
 )
 async def delete_session_endpoint(
     session_id: uuid.UUID,
@@ -440,7 +453,7 @@ async def delete_session_endpoint(
         "Ответ `202` всегда одинаков, письмо уходит только существующему аккаунту. Лимиты "
         "`auth_email_ip` и `auth_email_addr`."
     ),
-    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **_LIMIT_ERRORS},
+    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **LIMIT_ERRORS},
 )
 async def forgot_password_endpoint(
     body: ForgotPasswordRequest,
@@ -479,7 +492,7 @@ async def forgot_password_endpoint(
     dependencies=[Depends(limit_by_ip("auth_email_ip"))],
     responses={
         **problem_responses(ErrorCode.TOKEN_INVALID_OR_EXPIRED, ErrorCode.VALIDATION_ERROR),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def reset_password_endpoint(
@@ -510,9 +523,9 @@ async def reset_password_endpoint(
     ),
     dependencies=[Depends(limit_user("api_write", sensitive=True))],
     responses={
-        **_TOKEN_ERRORS,
+        **TOKEN_ERRORS,
         **problem_responses(ErrorCode.REAUTH_FAILED, ErrorCode.VALIDATION_ERROR),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def change_password_endpoint(
@@ -552,9 +565,9 @@ async def change_password_endpoint(
     ),
     dependencies=[Depends(limit_user("api_write", sensitive=True))],
     responses={
-        **_TOKEN_ERRORS,
+        **TOKEN_ERRORS,
         **problem_responses(ErrorCode.REAUTH_FAILED, ErrorCode.VALIDATION_ERROR),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def change_email_endpoint(
@@ -590,7 +603,7 @@ async def change_email_endpoint(
     dependencies=[Depends(limit_by_ip("auth_email_ip"))],
     responses={
         **problem_responses(ErrorCode.TOKEN_INVALID_OR_EXPIRED, ErrorCode.VALIDATION_ERROR),
-        **_LIMIT_ERRORS,
+        **LIMIT_ERRORS,
     },
 )
 async def confirm_email_endpoint(
@@ -611,7 +624,7 @@ async def confirm_email_endpoint(
     summary="Свободен ли ник",
     description="Лимит `username_check_ip`.",
     dependencies=[Depends(limit_by_ip("username_check_ip"))],
-    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **_LIMIT_ERRORS},
+    responses={**problem_responses(ErrorCode.VALIDATION_ERROR), **LIMIT_ERRORS},
 )
 async def username_available(
     uow: UowDep, username: Annotated[str, Query(min_length=1, max_length=100)]
@@ -624,16 +637,134 @@ async def username_available(
     "",
     response_model=MeUser,
     summary="Текущий пользователь",
-    description="Профиль, настройки приватности и счётчики добавятся в S3. Лимит `api_read`.",
-    dependencies=[Depends(limit_user("api_read"))],
-    responses={**_TOKEN_ERRORS, **_LIMIT_ERRORS},
+    description=(
+        "Учётная запись, профиль, настройки приватности и счётчики (пока нулевые). Доступна и "
+        "аккаунту, который ждёт удаления (`status: deletion_pending`). Лимит `api_read`."
+    ),
+    dependencies=[Depends(limit_user("api_read", allow_deletion_pending=True))],
+    responses={**TOKEN_ERRORS, **LIMIT_ERRORS},
 )
-async def read_me(principal: PrincipalDep, uow: UowDep) -> MeUser:
-    me = await get_me(uow.session, principal.user_id)
+async def read_me(
+    principal: PrincipalAllowingDeletionDep, uow: UowDep, identity: IdentityDep
+) -> MeUser:
+    me = await get_me(uow.session, principal.user_id, identity.me_extras)
     if me is None:
         # Токен подписан нами, но пользователя уже нет (удалён): для клиента это то же, что неверный токен.
-        raise unauthorized(ErrorCode.TOKEN_INVALID, "The user of this token no longer exists.")
+        raise token_user_gone()
     return me
+
+
+@me_router.patch(
+    "/username",
+    response_model=UsernameResponse,
+    summary="Смена ника",
+    description=(
+        "Не чаще раза в 30 дней, первая смена бесплатна. Прежний ник остаётся занятым ещё 30 дней. "
+        "Тот же ник, что сейчас, сменой не считается. Лимит `api_write`."
+    ),
+    dependencies=[Depends(limit_user("api_write"))],
+    responses={
+        **TOKEN_ERRORS,
+        **problem_responses(
+            ErrorCode.ACCOUNT_DELETION_PENDING,
+            ErrorCode.USERNAME_TAKEN,
+            ErrorCode.USERNAME_CHANGE_COOLDOWN,
+            ErrorCode.VALIDATION_ERROR,
+        ),
+        **LIMIT_ERRORS,
+    },
+)
+async def change_username_endpoint(
+    body: ChangeUsernameRequest,
+    principal: PrincipalDep,
+    uow: UowDep,
+    resources: ResourcesDep,
+    client: ClientDep,
+) -> UsernameResponse:
+    username = await change_username(
+        ChangeUsername(user_id=principal.user_id, username=body.username, client=client),
+        uow=uow,
+        settings=resources.settings,
+    )
+    return UsernameResponse(username=username)
+
+
+@me_router.delete(
+    "",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=DeletionScheduledResponse,
+    summary="Удалить аккаунт",
+    description=(
+        "Запрос удаления: аккаунт получает статус `deletion_pending`, профиль и записи скрываются, "
+        "остальные сессии закрываются; данные уничтожаются через 14 дней, до этого аккаунт можно "
+        "восстановить (`POST /me/restore`). Нужен пароль (аккаунту без пароля: сессия не старше "
+        "пяти минут). Пока аккаунт ждёт удаления, доступны только `GET /me`, `POST /me/restore` и "
+        "выход. Чувствительная операция: без Redis отвечает `503`."
+    ),
+    dependencies=[Depends(limit_user("api_write", sensitive=True))],
+    responses={
+        **TOKEN_ERRORS,
+        **problem_responses(
+            ErrorCode.REAUTH_FAILED,
+            ErrorCode.ACCOUNT_DELETION_PENDING,
+            ErrorCode.ROLE_MUST_BE_REVOKED,
+            ErrorCode.VALIDATION_ERROR,
+        ),
+        **LIMIT_ERRORS,
+    },
+)
+async def delete_me_endpoint(
+    principal: SensitivePrincipalDep,
+    uow: UowDep,
+    identity: IdentityDep,
+    resources: ResourcesDep,
+    client: ClientDep,
+    body: DeleteAccountRequest | None = None,
+) -> DeletionScheduledResponse:
+    scheduled_at = await request_deletion(
+        RequestDeletion(
+            actor=Actor(principal.user_id, principal.session_id),
+            password=body.password if body is not None else None,
+            client=client,
+        ),
+        uow=uow,
+        passwords=identity.passwords,
+        limiter=resources.limiter,
+        denylist=identity.denylist,
+        jobs=resources.jobs,
+        settings=resources.settings,
+    )
+    return DeletionScheduledResponse(deletion_scheduled_at=scheduled_at)
+
+
+@me_router.post(
+    "/restore",
+    response_model=MeUser,
+    summary="Восстановить аккаунт",
+    description=(
+        "Отменяет удаление до наступления срока. Закрытые при запросе сессии остаются закрытыми. "
+        "Лимит `api_write`."
+    ),
+    dependencies=[Depends(limit_user("api_write", allow_deletion_pending=True))],
+    responses={
+        **TOKEN_ERRORS,
+        **problem_responses(ErrorCode.NOT_PENDING_DELETION),
+        **LIMIT_ERRORS,
+    },
+)
+async def restore_me_endpoint(
+    principal: PrincipalAllowingDeletionDep,
+    uow: UowDep,
+    identity: IdentityDep,
+    client: ClientDep,
+) -> MeUser:
+    return await restore_account(
+        user_id=principal.user_id,
+        uow=uow,
+        denylist=identity.denylist,
+        me_extras=identity.me_extras,
+        client=client,
+    )
 
 
 @legal_router.get(

@@ -41,9 +41,26 @@ def test_password_is_kept_exactly_as_typed() -> None:
     assert request.password == "  spaces kept 12  "
 
 
-def test_unknown_fields_are_rejected_including_profile_fields_of_the_final_contract() -> None:
-    assert error_types({**VALID, "display_name": "Иван"}) == {"display_name": "extra_forbidden"}
-    assert error_types({**VALID, "language": "ru"}) == {"language": "extra_forbidden"}
+def test_profile_fields_are_optional_and_normalized() -> None:
+    bare = RegisterRequest.model_validate(VALID)
+    assert (bare.display_name, bare.language, bare.timezone) == (None, None, None)
+    full = RegisterRequest.model_validate(
+        {**VALID, "display_name": "  Иван  ", "language": "ru-ru", "timezone": "Europe/Moscow"}
+    )
+    assert (full.display_name, full.language, full.timezone) == ("Иван", "ru-RU", "Europe/Moscow")
+
+
+def test_profile_fields_have_the_same_limits_as_in_the_profile_endpoint() -> None:
+    assert error_types({**VALID, "display_name": ""}) == {"display_name": "string_too_short"}
+    assert error_types({**VALID, "display_name": "x" * 51}) == {"display_name": "string_too_long"}
+    assert error_types({**VALID, "language": "klingon-ish"}) == {"language": "invalid_format"}
+    assert error_types({**VALID, "timezone": "Moscow"}) == {"timezone": "invalid_format"}
+
+
+def test_unknown_fields_are_rejected_including_consent_fields_of_the_full_contract() -> None:
+    """Объекты `consents` и `age_confirmed` из 5.2 в упрощённой юридической части не нужны (план 1.2)."""
+    assert error_types({**VALID, "age_confirmed": True}) == {"age_confirmed": "extra_forbidden"}
+    assert error_types({**VALID, "consents": {}}) == {"consents": "extra_forbidden"}
 
 
 def test_the_schema_leaves_the_consent_decision_to_the_command() -> None:

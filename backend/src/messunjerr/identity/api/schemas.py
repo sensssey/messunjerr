@@ -3,12 +3,13 @@
 import uuid
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, StrictBool
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictBool
 from pydantic_core import PydanticCustomError
 
 from messunjerr.core.codes import ItemCode
+from messunjerr.core.fields import DisplayName, Language, Timezone
 from messunjerr.core.limits import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
-from messunjerr.core.schemas import RAW, ApiModel
+from messunjerr.core.schemas import RAW, ApiModel, UtcDateTime
 from messunjerr.identity.domain.emails import EmailProblem, InvalidEmailError, normalize_email
 from messunjerr.identity.domain.usernames import USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH
 from messunjerr.identity.queries.models import MeUser
@@ -49,6 +50,15 @@ class RegisterRequest(ApiModel):
     email: Email
     username: Username
     password: Password
+    display_name: DisplayName | None = Field(
+        default=None, description="Имя для показа, 1–50 символов; по умолчанию равно нику."
+    )
+    language: Language | None = Field(
+        default=None, description="Язык интерфейса, BCP 47 (`ru`, `en-US`)."
+    )
+    timezone: Timezone | None = Field(
+        default=None, description="Часовой пояс из базы IANA (`Europe/Moscow`)."
+    )
     accept_terms: Annotated[
         StrictBool,
         Field(
@@ -108,6 +118,48 @@ class ChangeEmailRequest(ApiModel):
 
 class ConfirmEmailRequest(ApiModel):
     token: Annotated[str, Field(min_length=1, max_length=256)]
+
+
+class ChangeUsernameRequest(ApiModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"username": "ivan_petrov"}]})
+
+    username: Username
+
+
+class UsernameResponse(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"username": "ivan_petrov"}]})
+
+    username: str
+
+
+class DeleteAccountRequest(ApiModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"password": "correct horse battery staple"}]}
+    )
+
+    password: Annotated[
+        str | None,
+        RAW,
+        Field(
+            default=None,
+            min_length=1,
+            max_length=PASSWORD_MAX_LENGTH,
+            description=(
+                "Текущий пароль. Аккаунту без пароля (только вход через OAuth) он не нужен: хватает "
+                "сессии не старше пяти минут."
+            ),
+        ),
+    ]
+
+
+class DeletionScheduledResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"deletion_scheduled_at": "2026-10-19T12:34:56.789Z"}]}
+    )
+
+    deletion_scheduled_at: UtcDateTime = Field(
+        description="Когда аккаунт и данные будут удалены, если его не восстановить."
+    )
 
 
 class SessionsResponse(BaseModel):

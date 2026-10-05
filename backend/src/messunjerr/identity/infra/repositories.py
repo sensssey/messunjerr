@@ -4,11 +4,17 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from messunjerr.identity.infra.models import EmailTokenRow, SessionRow, UserRow
+from messunjerr.identity.infra.models import (
+    EmailTokenRow,
+    SessionRow,
+    UsernameReservationRow,
+    UserRow,
+)
 
 
 def violated_constraint(error: IntegrityError) -> str | None:
@@ -148,6 +154,43 @@ class SessionRepository:
         # synchronize_session не нужен: загруженные объекты сессий в этих командах не используются.
         result = await self._session.execute(statement.execution_options(synchronize_session=False))
         return list(result.scalars())
+
+
+class UsernameReservationRepository:
+    """Прежние ники, которые другие брать не могут (5.3, S3-03)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def reserve(self, username: str, *, user_id: uuid.UUID, until: datetime) -> None:
+        """Резервирует ник за человеком до `until`. Просроченная запись, до которой не добралась
+        очистка, перезаписывается: ник мог за это время достаться другому и теперь освобождается снова."""
+        statement = pg_insert(UsernameReservationRow).values(
+            username=username, user_id=user_id, reserved_until=until
+        )
+        await self._session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[UsernameReservationRow.username],
+                set_={"user_id": statement.excluded.user_id, "reserved_until": until},
+            )
+        )
+
+    async def delete_expired(self, *, now: datetime, limit: int) -> int:
+        """Удаляет не более `limit` резервов, срок которых вышел; с `SKIP LOCKED`, как и прочая очистка."""
+        expired = aliased(UsernameReservationRow)
+        stale = (
+            select(expired.username)
+            .where(expired.reserved_until <= now)
+            .limit(limit)
+            .with_for_update(skip_locked=True, of=expired)
+        )
+        result = await self._session.execute(
+            delete(UsernameReservationRow)
+            .where(UsernameReservationRow.username.in_(stale))
+            .returning(UsernameReservationRow.username)
+            .execution_options(synchronize_session=False)
+        )
+        return len(result.all())
 
 
 class EmailTokenRepository:

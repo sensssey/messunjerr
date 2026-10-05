@@ -1,0 +1,12 @@
+{% extends "_base.html.j2" %}
+{% block title %}Удаление аккаунта{% endblock %}
+{% block heading %}Запрошено удаление аккаунта{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Для вашего аккаунта в {{ app_name }} запрошено удаление. Аккаунт и данные будут удалены <strong>{{ scheduled_at }}</strong> (через {{ grace_days }} дн.).</p>
+<p style="margin:0 0 16px;">До этого срока профиль и записи скрыты от других людей, но аккаунт можно восстановить.</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ login_url }}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Войти и восстановить</a>
+</p>
+<p style="margin:0 0 8px;">Если это были не вы, срочно восстановите доступ и смените пароль:</p>
+<p style="margin:0;font-size:14px;"><a href="{{ reset_url }}">Восстановить доступ</a></p>
+{% endblock %}

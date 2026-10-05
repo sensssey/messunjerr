@@ -170,3 +170,41 @@ def test_token_hash_is_sha256_digest() -> None:
     digest = hash_token("abc")
     assert digest == hashlib.sha256(b"abc").digest()
     assert len(digest) == 32
+
+
+# ----------------------------------------------------------------------------- ошибки аккаунта (S3)
+def test_a_deleted_user_of_a_valid_token_is_an_invalid_token() -> None:
+    from messunjerr.core.codes import ErrorCode
+    from messunjerr.identity.domain.errors import token_user_gone
+
+    error = token_user_gone()
+
+    assert error.code is ErrorCode.TOKEN_INVALID
+    assert error.status == 401
+    assert error.headers["WWW-Authenticate"] == 'Bearer error="invalid_token"'
+
+
+def test_the_error_factories_of_the_account_lifecycle_use_catalog_statuses() -> None:
+    from messunjerr.core.codes import ErrorCode
+    from messunjerr.identity.domain.errors import (
+        account_deletion_pending,
+        not_pending_deletion,
+        role_must_be_revoked,
+        username_change_cooldown,
+    )
+
+    assert (account_deletion_pending().code, account_deletion_pending().status) == (
+        ErrorCode.ACCOUNT_DELETION_PENDING,
+        403,
+    )
+    assert (not_pending_deletion().code, not_pending_deletion().status) == (
+        ErrorCode.NOT_PENDING_DELETION,
+        409,
+    )
+    assert (role_must_be_revoked().code, role_must_be_revoked().status) == (
+        ErrorCode.ROLE_MUST_BE_REVOKED,
+        409,
+    )
+    cooldown = username_change_cooldown(7)
+    assert (cooldown.code, cooldown.status) == (ErrorCode.USERNAME_CHANGE_COOLDOWN, 409)
+    assert cooldown.extensions == {"retry_after_days": 7}

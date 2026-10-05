@@ -57,6 +57,23 @@ def _bootstrap(args: argparse.Namespace) -> int:
     return _migrate(args)
 
 
+def _seed(args: argparse.Namespace) -> int:
+    from messunjerr.seeding import (  # тяжёлые импорты только этой команде
+        SEED_PASSWORD,
+        seed_database,
+    )
+
+    password: str = args.password or SEED_PASSWORD
+    try:
+        result = asyncio.run(seed_database(get_settings(), users=args.users, password=password))
+    except RuntimeError as error:
+        print(f"seed: {error}", file=sys.stderr)
+        return 1
+    print(f"seed: создано аккаунтов {result.created}, уже было {result.existing}")
+    print(f"seed: вход под seed_0001 … seed_{args.users:04d}, пароль {password}")
+    return 0
+
+
 def _healthcheck(args: argparse.Namespace) -> int:
     """Для HEALTHCHECK контейнера: код 0, если процесс отвечает на /health/live."""
     try:
@@ -107,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("migrate", help="применить миграции до head").set_defaults(handler=_migrate)
     sub.add_parser("bootstrap", help="db-init и migrate").set_defaults(handler=_bootstrap)
+
+    seed = sub.add_parser(
+        "seed", help="создать учебные аккаунты с профилями (только dev и test, повтор безопасен)"
+    )
+    seed.add_argument("--users", type=int, default=30, help="сколько аккаунтов (по умолчанию 30)")
+    seed.add_argument("--password", default=None, help="общий пароль (по умолчанию учебный)")
+    seed.set_defaults(handler=_seed)
 
     health = sub.add_parser("healthcheck", help="проверить /health/live для HEALTHCHECK")
     health.add_argument("--url", default="http://127.0.0.1:8000/health/live")

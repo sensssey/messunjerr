@@ -199,14 +199,14 @@ async def test_all_problems_are_reported_together(client: httpx.AsyncClient) -> 
     }
 
 
-async def test_profile_fields_are_not_part_of_the_contract_until_s3(
+async def test_consent_fields_of_the_full_contract_are_unknown_in_the_simplified_one(
     client: httpx.AsyncClient,
 ) -> None:
-    response, _ = await register(client, display_name="Иван")
+    response, _ = await register(client, age_confirmed=True)
 
     assert response.status_code == 422
     (error,) = errors_of(response)
-    assert (error["pointer"], error["code"]) == ("/body/display_name", "unknown_field")
+    assert (error["pointer"], error["code"]) == ("/body/age_confirmed", "unknown_field")
 
 
 @pytest.mark.parametrize("same_case", [True, False])

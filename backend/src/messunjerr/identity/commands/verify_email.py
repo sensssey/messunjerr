@@ -9,6 +9,7 @@ from messunjerr.core.uow import UnitOfWork
 from messunjerr.identity.commands.common import (
     ClientInfo,
     SignedIn,
+    confirm_deletion_flag_after_commit,
     ensure_can_sign_in,
     start_session,
 )
@@ -16,8 +17,10 @@ from messunjerr.identity.commands.mail import PURPOSE_VERIFY_EMAIL
 from messunjerr.identity.domain.errors import token_invalid_or_expired
 from messunjerr.identity.domain.events import EmailVerified, record
 from messunjerr.identity.infra.jwt_service import TokenService
+from messunjerr.identity.infra.ports import MeExtrasProvider
 from messunjerr.identity.infra.repositories import EmailTokenRepository, UserRepository
-from messunjerr.identity.queries.models import MeUser
+from messunjerr.identity.infra.session_denylist import SessionDenylist
+from messunjerr.identity.queries.me import build_me
 from messunjerr.settings import Settings
 
 
@@ -32,6 +35,8 @@ async def verify_email(
     *,
     uow: UnitOfWork,
     tokens: TokenService,
+    denylist: SessionDenylist,
+    me_extras: MeExtrasProvider,
     settings: Settings,
     now: datetime | None = None,
 ) -> SignedIn:
@@ -68,5 +73,7 @@ async def verify_email(
         now=moment,
     )
     user.last_login_at = moment
+    confirm_deletion_flag_after_commit(uow, denylist, user)
+    me = await build_me(uow.session, user, me_extras)
     await uow.commit()
-    return SignedIn(user=MeUser.from_row(user), grant=grant)
+    return SignedIn(user=me, grant=grant)

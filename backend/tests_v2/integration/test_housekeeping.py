@@ -280,6 +280,15 @@ async def test_the_default_worker_runs_both_cleanup_tasks(
         " VALUES (:u, 'old', sha256('x'::bytea), 201, now() - interval '8 days')",
         u=uuid.uuid4(),
     )
+    for name, days in (("gone_name", -1), ("live_name", 1)):
+        await execute(
+            admin_engine,
+            "INSERT INTO identity.username_reservations (username, user_id, reserved_until)"
+            " VALUES (:n, :u, now() + make_interval(days => :d))",
+            n=name,
+            u=uuid.UUID(keeper),
+            d=days,
+        )
     queue = ArqJobQueue(test_settings.redis_url.get_secret_value())
     try:
         assert await queue.enqueue(TASK_CLEANUP_UNVERIFIED_ACCOUNTS, queue=QUEUE_DEFAULT)
@@ -293,3 +302,9 @@ async def test_the_default_worker_runs_both_cleanup_tasks(
     assert stale not in await user_ids(admin_engine)
     assert keeper in await user_ids(admin_engine)
     assert await fetch_all(admin_engine, "SELECT 1 FROM platform.idempotency_keys") == []
+    left = await fetch_all(
+        admin_engine, "SELECT username::text AS u FROM identity.username_reservations"
+    )
+    assert [row["u"] for row in left] == [
+        "live_name"
+    ]  # резерв с вышедшим сроком убран, живой остался

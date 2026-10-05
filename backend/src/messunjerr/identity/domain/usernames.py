@@ -4,11 +4,13 @@
 """
 
 import re
+import uuid
 from enum import StrEnum
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,30}$")
 USERNAME_MIN_LENGTH = 3
 USERNAME_MAX_LENGTH = 30
+_UUID_TEXT = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
 # Ники, которые заняты под адреса, роли и сервисные страницы: человек получить их не может.
 RESERVED_USERNAMES: frozenset[str] = frozenset(
@@ -43,3 +45,15 @@ def check_username(username: str) -> UsernameProblem | None:
     if username in RESERVED_USERNAMES:
         return UsernameProblem.RESERVED
     return None
+
+
+def parse_user_ref(ref: str) -> uuid.UUID | str | None:
+    """Разбирает `{ref}` из `/users/{ref}` (5.3): UUID в каноническом виде или ник.
+
+    Ник не совпадает по форме с UUID (в нём нет дефисов), поэтому неоднозначности нет. Всё, что не
+    похоже ни на то, ни на другое, даёт `None`: для клиента это «такого нет», а не ошибка формата.
+    """
+    if _UUID_TEXT.fullmatch(ref):
+        return uuid.UUID(ref)
+    username = normalize_username(ref)
+    return username if USERNAME_PATTERN.fullmatch(username) else None

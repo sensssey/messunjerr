@@ -1,0 +1,215 @@
+### messunjerr API v2: профили, приватность, ник и удаление аккаунта (спринт S3)
+#
+# Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
+# токены из писем тогда копируются руками из Mailpit). Стек поднимает `make up` или `./dev.ps1 up`,
+# письма смотрим в Mailpit: http://localhost:8025. Выполняйте запросы по порядку, сверху вниз.
+#
+# Чтобы было на кого смотреть, создайте учебные аккаунты: `make seed` (или `./dev.ps1 seed`).
+# Они называются seed_0001, seed_0002… (пароль печатает команда), каждый пятый профиль закрыт.
+
+@host = http://localhost:8000
+@mailpit = http://localhost:8025
+@password = correct horse battery staple
+
+### Подготовка ###########################################################################
+
+### 1. Регистрация: к профилю относятся необязательные display_name, language и timezone
+# По умолчанию имя для показа равно нику. Профиль и настройки приватности создаются сразу.
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("demo_user", "demo_" + suffix);
+    client.global.set("demo_email", "demo_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{demo_email}}",
+  "username": "{{demo_user}}",
+  "password": "{{password}}",
+  "display_name": "Иван Петров",
+  "language": "ru",
+  "timezone": "Europe/Moscow",
+  "accept_terms": true
+}
+
+### 2. Письмо подтверждения в Mailpit (воркер отправляет за секунду-две)
+GET {{mailpit}}/api/v1/search?query=to:{{demo_email}}&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+### 3. Токен подтверждения из текста письма (он во фрагменте ссылки: #token=...)
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("verify_token", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 4. Подтверждение почты и вход: в ответе уже полный `user` (профиль, приватность, счётчики)
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{verify_token}}" }
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+    client.global.set("my_id", response.body.user.id);
+%}
+
+### Профиль ##############################################################################
+
+### 5. Текущий пользователь: учётная запись, профиль, приватность, счётчики (пока нулевые)
+GET {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+
+### 6. Править профиль можно частями: отсутствующий ключ без изменений, null очищает поле
+# Возраст проверяется по birth_date (минимум 18 лет, `MIN_AGE`), ссылки только http и https.
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "bio": "Люблю горы",
+  "links": [{ "title": "Блог", "url": "https://example.com" }],
+  "birth_date": "1990-05-12",
+  "birth_date_visibility": "day_month",
+  "city": "Казань"
+}
+
+### 7. Очистить поле: null (пустая строка в bio и city делает то же)
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "city": null }
+
+### 8. Закрыть профиль: чужие увидят только имя, ник, аватар, био и счётчики
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "is_private": true }
+
+### 9. Свой профиль глазами людей: по нику или по id, зритель видит то, что разрешает политика
+GET {{host}}/api/v1/users/{{demo_user}}
+Authorization: Bearer {{access_token}}
+
+###
+GET {{host}}/api/v1/users/{{my_id}}
+Authorization: Bearer {{access_token}}
+
+### 10. Чужой профиль: открытый (seed_0004) и закрытый (seed_0005), нужен `make seed`
+GET {{host}}/api/v1/users/seed_0004
+Authorization: Bearer {{access_token}}
+
+###
+GET {{host}}/api/v1/users/seed_0005
+Authorization: Bearer {{access_token}}
+
+### Приватность ##########################################################################
+
+### 11. Настройки приватности: кто пишет, комментирует, упоминает, видит списки и «в сети»
+GET {{host}}/api/v1/me/privacy
+Authorization: Bearer {{access_token}}
+
+### 12. Изменить часть настроек (значения из перечислений)
+PATCH {{host}}/api/v1/me/privacy
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "dm_policy": "everyone", "friends_list_visibility": "everyone", "presence_visibility": "nobody" }
+
+### Ник ###################################################################################
+
+### 13. Занятый ник: 409 username_taken (нужен `make seed`; неудачная попытка паузу не запускает)
+PATCH {{host}}/api/v1/me/username
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "username": "seed_0001" }
+
+### 14. Зарезервированный системой ник: 422 username_reserved
+PATCH {{host}}/api/v1/me/username
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "username": "admin" }
+
+### 15. Сменить ник: первая смена бесплатна, дальше не чаще раза в 30 дней
+# Прежний ник остаётся занятым ещё 30 дней (его не зарегистрируют и не займут другие).
+< {%
+    client.global.set("new_user", "renamed_" + Math.random().toString(36).slice(2, 8));
+%}
+PATCH {{host}}/api/v1/me/username
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "username": "{{new_user}}" }
+
+### 16. Вторая смена сразу же: 409 username_change_cooldown, в retry_after_days число дней
+PATCH {{host}}/api/v1/me/username
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "username": "{{new_user}}_2" }
+
+### 17. Прежний ник занят: available = false, reason = taken
+GET {{host}}/api/v1/auth/username-available?username={{demo_user}}
+
+### Удаление аккаунта #####################################################################
+
+### 18. Запросить удаление: 202, срок через 14 дней; остальные сессии закрываются
+# Дальше доступны только GET /me, POST /me/restore и выход: всё остальное 403 account_deletion_pending.
+DELETE {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "password": "{{password}}" }
+
+### 19. Статус виден в /me: deletion_pending
+GET {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+
+### 20. Любая другая ручка закрыта: 403 account_deletion_pending
+GET {{host}}/api/v1/me/privacy
+Authorization: Bearer {{access_token}}
+
+### 21. Передумали: восстановить аккаунт до наступления срока (в ответ полный MeUser)
+POST {{host}}/api/v1/me/restore
+Authorization: Bearer {{access_token}}
+
+### Негативные случаи ####################################################################
+
+### Неверный пароль при удалении: 403 reauth_failed, аккаунт не тронут
+DELETE {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "password": "wrong password!" }
+
+### Несовершеннолетний: 422, код элемента underage по pointer /body/birth_date
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "birth_date": "2015-01-01" }
+
+### Ссылка не http и не https: 422 invalid_format по pointer /body/links/0/url
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "links": [{ "title": "Скрипт", "url": "javascript:alert(1)" }] }
+
+### Аватар пока недоступен: 422 asset_not_found (загрузки файлов появятся в S5–S6)
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "avatar_asset_id": "0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80" }
+
+### Несуществующий пользователь: 404 not_found (так же отвечает заблокированный и неактивный)
+GET {{host}}/api/v1/users/nobody_here
+Authorization: Bearer {{access_token}}

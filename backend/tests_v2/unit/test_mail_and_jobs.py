@@ -137,6 +137,16 @@ SECURITY_MAILS: dict[str, tuple[dict[str, Any], str, list[str]]] = {
         "Почта аккаунта в messunjerr изменена",
         ["n***@example.org", "http://x/forgot"],
     ),
+    "account_deletion_requested": (
+        {
+            "scheduled_at": "19.10.2026 12:34 UTC",
+            "grace_days": 14,
+            "login_url": "http://x/login",
+            "reset_url": "http://x/forgot",
+        },
+        "Удаление аккаунта в messunjerr",
+        ["19.10.2026 12:34 UTC", "14 дн.", "http://x/login", "http://x/forgot", "восстановить"],
+    ),
 }
 
 

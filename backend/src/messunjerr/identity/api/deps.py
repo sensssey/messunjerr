@@ -15,8 +15,13 @@ from messunjerr.core.deps import ResourcesDep
 from messunjerr.core.logs import get_logger
 from messunjerr.core.ratelimit_deps import enforce
 from messunjerr.identity.commands.common import ClientInfo
-from messunjerr.identity.domain.errors import service_unavailable, unauthorized
+from messunjerr.identity.domain.errors import (
+    account_deletion_pending,
+    service_unavailable,
+    unauthorized,
+)
 from messunjerr.identity.infra.jwt_service import AccessTokenError
+from messunjerr.identity.infra.session_denylist import AccessState
 from messunjerr.identity.services import IdentityServices
 
 
@@ -62,12 +67,18 @@ bearer_scheme = HTTPBearer(
 
 
 async def _authenticate(
-    credentials: HTTPAuthorizationCredentials | None, identity: IdentityServices, *, strict: bool
+    credentials: HTTPAuthorizationCredentials | None,
+    identity: IdentityServices,
+    *,
+    strict: bool,
+    allow_deletion_pending: bool = False,
 ) -> Principal:
-    """Подпись, срок, `iss`, `aud`, `scp` и denylist сессий (4.7).
+    """Подпись, срок, `iss`, `aud`, `scp`, denylist сессий и признак удаления аккаунта (4.7, 5.1).
 
-    `strict` для чувствительных операций: без Redis denylist не проверить, и ответ `503`. Общие
-    ручки в этом случае работают без проверки отзыва (с предупреждением в журнале).
+    `strict` для чувствительных операций: без Redis отзыв сессии и признак удаления не проверить, и
+    ответ `503`. Общие ручки в этом случае работают без этих проверок (с предупреждением в журнале).
+    Аккаунт, который ждёт удаления, пускают только на `GET /me` и `POST /me/restore`
+    (`allow_deletion_pending`); остальное даёт `403 account_deletion_pending`.
     """
     if credentials is None or not credentials.credentials.strip():
         raise unauthorized(ErrorCode.TOKEN_MISSING, "A bearer access token is required.")
@@ -80,14 +91,16 @@ async def _authenticate(
         raise unauthorized(ErrorCode.TOKEN_INVALID, "The token scope is not supported.")
 
     try:
-        revoked = await identity.denylist.is_revoked(claims.session_id)
+        state = await identity.denylist.access_state(claims.session_id, claims.user_id)
     except (RedisError, OSError, TimeoutError) as error:
         if strict:
             raise service_unavailable("Session checks are temporarily unavailable.") from error
         get_logger("messunjerr.identity").warning("session_denylist_unavailable")
-        revoked = False
-    if revoked:
+        state = AccessState()
+    if state.revoked:
         raise unauthorized(ErrorCode.SESSION_REVOKED, "The session has been revoked.")
+    if state.deletion_pending and not allow_deletion_pending:
+        raise account_deletion_pending()
     return Principal(
         user_id=claims.user_id,
         session_id=claims.session_id,
@@ -107,12 +120,21 @@ async def get_sensitive_principal(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     identity: IdentityDep,
 ) -> Principal:
-    """Для смены пароля и почты, «выйти везде», управления сессиями: при недоступном Redis `503`."""
+    """Для смены пароля и почты, удаления аккаунта, «выйти везде», сессий: при недоступном Redis `503`."""
     return await _authenticate(credentials, identity, strict=True)
+
+
+async def get_principal_allowing_deletion(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+    identity: IdentityDep,
+) -> Principal:
+    """Для `GET /me` и `POST /me/restore`: пускает и аккаунт, который ждёт удаления (5.1)."""
+    return await _authenticate(credentials, identity, strict=False, allow_deletion_pending=True)
 
 
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
 SensitivePrincipalDep = Annotated[Principal, Depends(get_sensitive_principal)]
+PrincipalAllowingDeletionDep = Annotated[Principal, Depends(get_principal_allowing_deletion)]
 
 
 async def principal_user_id(request: Request) -> uuid.UUID | None:
@@ -127,8 +149,14 @@ async def principal_user_id(request: Request) -> uuid.UUID | None:
         return None
 
 
-def limit_user(*buckets: str, sensitive: bool = False) -> Callable[..., Awaitable[None]]:
-    """Зависимость: лимиты по пользователю (`api_read`, `api_write`) и заголовки `RateLimit-*`."""
+def limit_user(
+    *buckets: str, sensitive: bool = False, allow_deletion_pending: bool = False
+) -> Callable[..., Awaitable[None]]:
+    """Зависимость: лимиты по пользователю (`api_read`, `api_write`) и заголовки `RateLimit-*`.
+
+    Принимает те же виды допуска, что и сама ручка: `sensitive` (без Redis `503`) и
+    `allow_deletion_pending` (аккаунт, который ждёт удаления, не отсекается).
+    """
     if sensitive:
 
         async def sensitive_dependency(
@@ -141,6 +169,19 @@ def limit_user(*buckets: str, sensitive: bool = False) -> Callable[..., Awaitabl
             await enforce(resources.limiter, checks, response, request)
 
         return sensitive_dependency
+
+    if allow_deletion_pending:
+
+        async def tolerant_dependency(
+            principal: PrincipalAllowingDeletionDep,
+            request: Request,
+            response: Response,
+            resources: ResourcesDep,
+        ) -> None:
+            checks = [(bucket, str(principal.user_id)) for bucket in buckets]
+            await enforce(resources.limiter, checks, response, request)
+
+        return tolerant_dependency
 
     async def dependency(
         principal: PrincipalDep, request: Request, response: Response, resources: ResourcesDep

@@ -14,7 +14,6 @@ from sqlalchemy.exc import IntegrityError
 
 from messunjerr.core.audit import record_audit
 from messunjerr.core.clock import utcnow
-from messunjerr.core.codes import ErrorCode
 from messunjerr.core.jobs import JobQueue
 from messunjerr.core.ratelimit import RateLimiter
 from messunjerr.core.security import hash_token
@@ -29,7 +28,7 @@ from messunjerr.identity.commands.mail import (
     send_email_changed_notice,
 )
 from messunjerr.identity.domain import audit
-from messunjerr.identity.domain.errors import token_invalid_or_expired, unauthorized
+from messunjerr.identity.domain.errors import token_invalid_or_expired, token_user_gone
 from messunjerr.identity.infra.password_service import PasswordService
 from messunjerr.identity.infra.repositories import (
     EmailTokenRepository,
@@ -61,7 +60,7 @@ async def request_email_change(
     users = UserRepository(uow.session)
     user = await users.get_by_id(command.actor.user_id, for_update=True)
     if user is None:
-        raise unauthorized(ErrorCode.TOKEN_INVALID, "The user of this token no longer exists.")
+        raise token_user_gone()
     await verify_reauth(
         uow=uow,
         user=user,

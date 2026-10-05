@@ -56,7 +56,7 @@ async def test_platform_tables_exist(admin_engine: AsyncEngine) -> None:
 
 async def test_database_is_at_the_expected_head(admin_engine: AsyncEngine) -> None:
     (current,) = await scalars(admin_engine, "SELECT version_num FROM alembic_version")
-    assert current == expected_head() == "0002"
+    assert current == expected_head() == "0003"
 
 
 async def test_alembic_check_sees_no_drift_between_models_and_migrations(

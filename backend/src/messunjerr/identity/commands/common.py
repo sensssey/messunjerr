@@ -98,6 +98,18 @@ def account_subject(user: UserRow | None, login: str) -> str:
     return f"u:{user.id}" if user is not None else f"l:{subject_digest(login)}"
 
 
+def confirm_deletion_flag_after_commit(
+    uow: UnitOfWork, denylist: SessionDenylist, user: UserRow
+) -> None:
+    """Выдача токена аккаунту, который ждёт удаления, подтверждает признак в Redis.
+
+    Признак ставит `DELETE /me`; здесь он восстанавливается, если Redis его потерял, и продлевается
+    на срок нового токена. Сбой Redis UnitOfWork только записывает в журнал (как и отзыв сессий).
+    """
+    if user.status == "deletion_pending":
+        uow.after_commit(lambda: denylist.mark_deletion_pending(user.id))
+
+
 def revoke_in_denylist_after_commit(
     uow: UnitOfWork, denylist: SessionDenylist, session_ids: Sequence[uuid.UUID]
 ) -> None:

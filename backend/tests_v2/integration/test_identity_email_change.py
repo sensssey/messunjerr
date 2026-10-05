@@ -193,10 +193,10 @@ async def test_the_request_is_unavailable_without_redis(
     user = await verified_user(client, jobs)
     services: IdentityServices = app.state.identity
 
-    async def unreachable(session_id: Any) -> bool:
+    async def unreachable(*args: Any, **kwargs: Any) -> bool:
         raise ConnectionError("redis is down")
 
-    monkeypatch.setattr(services.denylist, "is_revoked", unreachable)
+    monkeypatch.setattr(services.denylist, "access_state", unreachable)
 
     response = await request_change(client, user)
 

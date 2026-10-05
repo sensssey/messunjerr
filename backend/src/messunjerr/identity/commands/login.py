@@ -19,6 +19,7 @@ from messunjerr.identity.commands.common import (
     ClientInfo,
     SignedIn,
     account_subject,
+    confirm_deletion_flag_after_commit,
     ensure_can_sign_in,
     start_session,
 )
@@ -27,8 +28,10 @@ from messunjerr.identity.domain.errors import invalid_credentials
 from messunjerr.identity.infra.jwt_service import TokenService
 from messunjerr.identity.infra.models import UserRow
 from messunjerr.identity.infra.password_service import PasswordService
+from messunjerr.identity.infra.ports import MeExtrasProvider
 from messunjerr.identity.infra.repositories import UserRepository
-from messunjerr.identity.queries.models import MeUser
+from messunjerr.identity.infra.session_denylist import SessionDenylist
+from messunjerr.identity.queries.me import build_me
 from messunjerr.settings import Settings
 
 _STATUS_REASONS = {
@@ -74,6 +77,8 @@ async def login(
     uow: UnitOfWork,
     passwords: PasswordService,
     tokens: TokenService,
+    denylist: SessionDenylist,
+    me_extras: MeExtrasProvider,
     limiter: RateLimiter,
     settings: Settings,
     now: datetime | None = None,
@@ -128,5 +133,8 @@ async def login(
         ip=command.client.ip,
         user_agent=command.client.user_agent,
     )
+    confirm_deletion_flag_after_commit(uow, denylist, user)
+    # Профиль читается до коммита: нет профиля, нет и входа (а не сессия, которой клиент не получит).
+    me = await build_me(uow.session, user, me_extras)
     await uow.commit()
-    return SignedIn(user=MeUser.from_row(user), grant=grant)
+    return SignedIn(user=me, grant=grant)

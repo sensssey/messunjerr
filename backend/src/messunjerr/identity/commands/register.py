@@ -32,7 +32,9 @@ from messunjerr.identity.domain.passwords import check_password_policy
 from messunjerr.identity.domain.usernames import UsernameProblem, check_username
 from messunjerr.identity.infra.models import UserRow
 from messunjerr.identity.infra.password_service import PasswordService
+from messunjerr.identity.infra.ports import ProfileProvisioner, ProfileSeed
 from messunjerr.identity.infra.repositories import UserRepository, violated_constraint
+from messunjerr.identity.queries.me import username_is_reserved
 from messunjerr.settings import Settings
 
 
@@ -50,6 +52,15 @@ class RegisterUser:
     username: str
     password: str
     accept_terms: bool
+    display_name: str | None = None
+    language: str | None = None
+    timezone: str | None = None
+
+    @property
+    def profile_seed(self) -> ProfileSeed:
+        return ProfileSeed(
+            display_name=self.display_name, language=self.language, timezone=self.timezone
+        )
 
 
 class _RaceError(Exception):
@@ -111,6 +122,8 @@ async def _register_once(
     )
     if owner is not None and not own_pending_username:
         raise username_taken()
+    if owner is None and await username_is_reserved(uow.session, command.username, now=now):
+        raise username_taken()  # прежний ник после чьей-то смены остаётся занятым (5.3)
 
     try:
         # Точка сохранения: нарушение уникальности не должно ломать всю транзакцию.
@@ -149,6 +162,7 @@ async def register_user(
     *,
     uow: UnitOfWork,
     passwords: PasswordService,
+    provisioner: ProfileProvisioner,
     jobs: JobQueue,
     settings: Settings,
     now: datetime | None = None,
@@ -174,6 +188,11 @@ async def register_user(
                 raise username_taken() from second
             raise
 
+    if outcome is not RegisterOutcome.EXISTS:
+        # Профиль создаётся в той же транзакции, что и аккаунт: строки без пары невозможны (S3-01).
+        await provisioner.provision(
+            uow.session, user_id=user.id, username=user.username, seed=command.profile_seed
+        )
     if outcome is RegisterOutcome.CREATED:
         record(uow.outbox, UserRegistered(user.id))
     if outcome is RegisterOutcome.EXISTS:

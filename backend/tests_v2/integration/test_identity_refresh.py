@@ -291,7 +291,7 @@ async def test_expired_session_is_refresh_expired(
     # Имя столбца берётся из параметров теста выше, а не из ввода.
     await execute(
         admin_engine,
-        f"UPDATE identity.sessions SET {column} = now() - interval '1 second'",  # noqa: S608
+        f"UPDATE identity.sessions SET {column} = now() - interval '1 second'",
     )
 
     response = await do_refresh(client, user.refresh_token)

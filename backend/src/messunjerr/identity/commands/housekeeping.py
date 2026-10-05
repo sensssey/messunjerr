@@ -1,6 +1,6 @@
-"""Плановая очистка identity: неподтверждённые аккаунты и отработавшие токены из писем.
+"""Плановая очистка identity: неподтверждённые аккаунты, отработавшие токены из писем, резервы ников.
 
-Запускает воркер очереди `default` (cron, `messunjerr.jobs`). Обе операции безопасны при повторе и
+Запускает воркер очереди `default` (cron, `messunjerr.jobs`). Все операции безопасны при повторе и
 при параллельном запуске двух воркеров: удаляют пачками с `FOR UPDATE SKIP LOCKED`.
 """
 
@@ -12,7 +12,11 @@ from messunjerr.core.audit import record_audit
 from messunjerr.core.clock import utcnow
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.identity.domain.audit import ACCOUNT_UNVERIFIED_PURGED, TARGET_USER
-from messunjerr.identity.infra.repositories import EmailTokenRepository, UserRepository
+from messunjerr.identity.infra.repositories import (
+    EmailTokenRepository,
+    UsernameReservationRepository,
+    UserRepository,
+)
 
 BATCH_SIZE = 500
 SPENT_TOKEN_GRACE = timedelta(days=7)
@@ -52,6 +56,30 @@ async def purge_unverified_accounts(
             await uow.commit()
         removed += len(ids)
         if len(ids) < batch_size:
+            return removed
+
+
+async def purge_username_reservations(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    now: datetime | None = None,
+    batch_size: int = BATCH_SIZE,
+) -> int:
+    """Удаляет резервы прежних ников, срок которых вышел (S3-03).
+
+    Для самого API резерв с истёкшим сроком уже не существует (он не учитывается при проверках), так
+    что очистка нужна только чтобы таблица не росла.
+    """
+    moment = now or utcnow()
+    removed = 0
+    while True:
+        async with UnitOfWork(sessionmaker) as uow:
+            count = await UsernameReservationRepository(uow.session).delete_expired(
+                now=moment, limit=batch_size
+            )
+            await uow.commit()
+        removed += count
+        if count < batch_size:
             return removed
 
 
