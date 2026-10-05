@@ -1,0 +1,26 @@
+# Хуки перед коммитом: `pip install pre-commit && pre-commit install`.
+# Ruff проверяет только код v2; v0.1 и фронтенд (будет переписан) хуки не трогают.
+exclude: ^(frontend/|\.idea/|backend/uv\.lock$)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        files: ^backend/(src/messunjerr|tests_v2|migrations)/
+      - id: ruff-format
+        files: ^backend/(src/messunjerr|tests_v2|migrations)/

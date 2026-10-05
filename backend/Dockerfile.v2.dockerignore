@@ -1,0 +1,12 @@
+# Контекст сборки Dockerfile.v2: только то, что нужно образу. Всё остальное (старый .venv, код v0.1,
+# тесты v0.1, IDE) в контекст не попадает.
+**
+!pyproject.toml
+!uv.lock
+!alembic.ini
+!.importlinter
+!src/messunjerr
+!migrations
+!tests_v2
+**/__pycache__
+**/*.pyc

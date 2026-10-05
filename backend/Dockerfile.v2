@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+# Образ бэкенда v2 (рядом лежит Dockerfile от v0.1, он до S13 остаётся нетронутым).
+# Цели: `dev` (все зависимости, исходники подключаются томами) и `prod` (минимум, не root).
+ARG PYTHON_VERSION=3.14
+
+FROM python:${PYTHON_VERSION}-slim AS base
+ARG UV_VERSION=0.12.23
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    PYTHONPATH=/app/src \
+    PATH=/opt/venv/bin:$PATH
+WORKDIR /app
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+# --------------------------------------------------------------------------- dev
+FROM base AS dev
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --group dev
+# Среду pyright (Node) скачиваем при сборке, а не при каждом запуске контейнера; ей нужен libatomic1.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pyright --version
+COPY src/messunjerr ./src/messunjerr
+COPY migrations ./migrations
+COPY alembic.ini .importlinter ./
+COPY tests_v2 ./tests_v2
+EXPOSE 8000
+CMD ["uvicorn", "messunjerr.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", \
+     "--reload", "--reload-dir", "/app/src", "--no-access-log"]
+
+# --------------------------------------------------------------------------- prod
+FROM base AS prod-deps
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+FROM python:${PYTHON_VERSION}-slim AS prod
+ARG APP_BUILD=dev
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
+    PATH=/opt/venv/bin:$PATH \
+    APP_BUILD=${APP_BUILD}
+WORKDIR /app
+COPY --from=prod-deps /opt/venv /opt/venv
+COPY src/messunjerr ./src/messunjerr
+COPY migrations ./migrations
+COPY alembic.ini ./
+# Приложение работает не от root.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["python", "-m", "messunjerr", "healthcheck"]
+CMD ["python", "-m", "messunjerr", "serve", "--host", "0.0.0.0"]

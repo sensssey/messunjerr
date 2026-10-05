@@ -1,0 +1,135 @@
+# CI бэкенда v2: линтеры и типы, тесты на настоящих PostgreSQL 18 и Redis, сборка боевого образа.
+# Код v0.1 (backend/src вне messunjerr) этим workflow не проверяется: он живёт до S13.
+name: backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - backend/**
+      - deploy/**
+      - scripts/**
+      - docs/backend-v2-spec.md
+      - .github/workflows/backend.yml
+  pull_request:
+    paths:
+      - backend/**
+      - deploy/**
+      - scripts/**
+      - docs/backend-v2-spec.md
+      - .github/workflows/backend.yml
+  workflow_dispatch:
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.23"
+
+jobs:
+  static:
+    name: Линтеры, типы, границы модулей
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: Зависимости
+        run: uv sync --frozen --group dev
+      - name: Lock-файл актуален
+        run: uv lock --check
+      - name: ruff (код)
+        run: uv run ruff check src tests_v2 migrations
+      - name: ruff (форматирование)
+        run: uv run ruff format --check src tests_v2 migrations
+      - name: pyright (strict)
+        run: uv run pyright
+      - name: import-linter
+        run: uv run lint-imports
+
+  tests:
+    name: Тесты (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.14", "3.13"]
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      # Сквозной тест письма: API -> arq -> воркер -> SMTP -> Mailpit.
+      mailpit:
+        image: axllent/mailpit:latest
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "/mailpit readyz"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    # Роли и временные базы тесты создают сами (db-init), поэтому нужны только эти адреса.
+    env:
+      ADMIN_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+      DATABASE_URL: postgresql+asyncpg://app:app-ci-password@127.0.0.1:5432/messunjerr
+      MIGRATOR_DATABASE_URL: postgresql+asyncpg://migrator:migrator-ci-password@127.0.0.1:5432/messunjerr
+      DB_READONLY_PASSWORD: readonly-ci-password
+      REDIS_URL: redis://127.0.0.1:6379/0
+      SMTP_URL: smtp://127.0.0.1:1025
+      MAILPIT_API_URL: http://127.0.0.1:8025
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: Зависимости
+        run: uv sync --frozen --group dev
+      # Включает тесты «миграции с нуля до head» и `alembic check` (tests_v2/integration).
+      - name: Тесты
+        run: uv run pytest -c pyproject.toml tests_v2 -ra
+
+  image:
+    name: Сборка образа
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Боевой образ (prod)
+        run: docker build -f backend/Dockerfile.v2 --target prod --build-arg APP_BUILD=${{ github.sha }} -t messunjerr-v2:ci backend
+      - name: Образ запускается
+        run: docker run --rm messunjerr-v2:ci python -m messunjerr --help
+      - name: Образ работает не от root
+        run: test "$(docker run --rm messunjerr-v2:ci id -u)" != "0"

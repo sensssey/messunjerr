@@ -1,0 +1,165 @@
+# Локальная среда разработки бэкенда v2: PostgreSQL 18, Redis, Mailpit и само приложение.
+# Старый стек v0.1 (docker-compose.yml в корне) живёт отдельно и этому не мешает: другие
+# порты, имя проекта и тома.
+#
+#   docker compose -f deploy/compose.dev.yml up -d --build      # поднять (или `make up`, `./dev.ps1 up`)
+#   docker compose -f deploy/compose.dev.yml run --rm tools pytest -c pyproject.toml tests_v2
+name: messunjerr-v2
+
+x-backend-env: &backend-env
+  APP_ENV: dev
+  APP_BUILD: dev
+  LOG_FORMAT: console
+  LOG_LEVEL: DEBUG
+  DATABASE_URL: postgresql+asyncpg://app:${DB_APP_PASSWORD}@postgres:5432/${DB_NAME:-messunjerr}
+  MIGRATOR_DATABASE_URL: postgresql+asyncpg://migrator:${DB_MIGRATOR_PASSWORD}@postgres:5432/${DB_NAME:-messunjerr}
+  ADMIN_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+  DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  # Токены, ссылки в письмах и почта (Mailpit ловит все письма разработки, веб-интерфейс на :8025).
+  JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+  SMTP_URL: smtp://mailpit:1025
+  MAIL_FROM: messunjerr <no-reply@messunjerr.local>
+  # Bind-mount с Windows не присылает inotify-события, поэтому --reload опрашивает файлы.
+  WATCHFILES_FORCE_POLLING: "true"
+
+x-backend: &backend
+  image: messunjerr-v2-dev
+  build:
+    context: ../backend
+    dockerfile: Dockerfile.v2
+    target: dev
+  environment: *backend-env
+  volumes:
+    # Подключаем только новый пакет: старый код v0.1 из backend/src в контейнер не попадает.
+    - ../backend/src/messunjerr:/app/src/messunjerr
+    - ../backend/migrations:/app/migrations
+    - ../backend/tests_v2:/app/tests_v2
+    - ../backend/pyproject.toml:/app/pyproject.toml:ro
+    - ../backend/alembic.ini:/app/alembic.ini:ro
+    - ../backend/.importlinter:/app/.importlinter:ro
+    # Документация и генератор кодов ошибок нужны тесту, который сверяет каталог кодов со спекой.
+    - ../docs:/docs:ro
+    - ../scripts:/scripts:ro
+  networks: [internal]
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "log_min_duration_statement=250ms"]
+    volumes:
+      # PostgreSQL 18: том монтируется в /var/lib/postgresql, а не в .../data.
+      - pgdata:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${PG_PORT:-54320}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [internal]
+
+  redis:
+    image: redis:8
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-63790}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [internal]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    networks: [internal]
+
+  # Одноразовая задача: роли и база, затем миграции до head. Идемпотентна.
+  migrate:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "bootstrap"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Воркер фоновых задач (arq): письма. По одному процессу на очередь; перезапускается при правке кода.
+  worker:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "worker", "--queue", "email", "--reload"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "worker", "--queue", "email", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Инструменты разработки (тесты, линтеры): `docker compose run --rm tools <команда>`.
+  tools:
+    <<: *backend
+    profiles: ["tools"]
+    environment:
+      <<: *backend-env
+      # Сквозной тест писем читает ящик Mailpit по HTTP.
+      MAILPIT_API_URL: http://mailpit:8025
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    command: ["true"]
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  internal:

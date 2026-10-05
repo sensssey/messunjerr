@@ -1,0 +1,126 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "messunjerr"
+dynamic = ["version"]
+description = "messunjerr backend v2: модульный монолит на FastAPI, PostgreSQL 18 и Redis"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi~=0.142.2",
+    "uvicorn[standard]~=0.54.0",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.10,<3",
+    "sqlalchemy[asyncio]>=2.1,<2.2",
+    "asyncpg>=0.31,<0.32",
+    "alembic>=1.20,<2",
+    "redis>=8.1,<9",
+    "structlog>=26.1,<27",
+    # S1: идентичность и письма
+    "pwdlib[argon2]>=0.3,<0.4",
+    "PyJWT[crypto]>=2.10,<3",
+    "email-validator>=2.2,<3",
+    "arq>=0.28,<0.29",
+    "aiosmtplib>=5,<6",
+    "jinja2>=3.1,<4",
+]
+
+[project.scripts]
+messunjerr = "messunjerr.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "pytest-cov>=6.0",
+    "httpx>=0.28",
+    "asgi-lifespan>=2.1",
+    "hypothesis>=6.100",
+    "ruff>=0.9",
+    "pyright>=1.1.390",
+    "import-linter>=2.1",
+    "pre-commit>=4.0",
+]
+
+[tool.uv]
+# R2 из спецификации: arq 0.28 (апрель 2026) заявляет redis<6, а проект на redis-py 8.1. Эмпирически
+# они совместимы (enqueue, дедупликация по job_id, повторы, отложенный запуск; два
+# DeprecationWarning, см. filterwarnings ниже), поэтому пин arq снят. Тест
+# tests_v2/integration/test_arq_compat.py сторожит эту связку при обновлениях зависимостей.
+override-dependencies = ["redis>=8.1,<9"]
+
+[tool.hatch.version]
+path = "src/messunjerr/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# В src/ рядом лежит код v0.1 (пакет `src`); в сборку попадает только новый пакет.
+packages = ["src/messunjerr"]
+
+# ---------------------------------------------------------------------------- pytest
+# В backend/ лежит pytest.ini от v0.1, поэтому тесты v2 запускаются с `-c pyproject.toml`
+# (Makefile, dev.ps1 и CI делают это сами).
+[tool.pytest.ini_options]
+testpaths = ["tests_v2"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
+markers = [
+    "integration: нужны PostgreSQL и Redis (см. tests_v2/integration/conftest.py)",
+]
+filterwarnings = [
+    "error",
+    # arq 0.28 пользуется параметрами redis-py, объявленными устаревшими в 5.0.1 и 6.0 (см. [tool.uv]).
+    "ignore:Call to '__init__' function with deprecated usage of input argument/s 'retry_on_timeout'.*:DeprecationWarning",
+    "ignore:Call to deprecated close\\. \\(Use aclose\\(\\) instead\\).*:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["messunjerr"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]
+
+# ---------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests_v2"]
+# Код v0.1 (src/auth, src/posts, ...) и его тесты живут до S13 и линтером не проверяются.
+include = ["pyproject.toml", "src/messunjerr/**/*.py", "tests_v2/**/*.py", "migrations/**/*.py"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "ASYNC", "PT", "SIM", "RUF",
+    "S", "T20", "TID", "PIE", "RET", "PERF", "DTZ", "ISC", "ICN", "LOG", "G", "FBT",
+]
+ignore = [
+    "E501",    # длину строк держит форматтер; длинные русские комментарии допустимы
+    "RUF001",  # кириллица в строках, комментариях и докстрингах: так задумано
+    "RUF002",
+    "RUF003",
+    "RET504",
+    "FBT001",  # булевы позиционные аргументы допустимы в небольших внутренних функциях
+    "FBT002",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests_v2/**" = ["S101", "S105", "S106", "S311", "PLR2004", "FBT003"]
+"migrations/**" = ["S608", "N999"]
+"src/messunjerr/core/dbinit.py" = ["S608"]
+"src/messunjerr/cli.py" = ["T201"]  # командная строка печатает результат в stdout
+
+[tool.ruff.lint.isort]
+known-first-party = ["messunjerr"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------- pyright
+[tool.pyright]
+include = ["src/messunjerr", "tests_v2", "migrations"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false

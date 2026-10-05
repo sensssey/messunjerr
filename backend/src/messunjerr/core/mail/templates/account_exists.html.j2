@@ -1,0 +1,11 @@
+{% extends "_base.html.j2" %}
+{% block title %}Вы уже зарегистрированы{% endblock %}
+{% block heading %}Вы уже зарегистрированы{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Кто-то (возможно, вы) пытался зарегистрироваться в {{ app_name }} с этим адресом электронной почты, но аккаунт с ним уже существует.</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ login_url }}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Войти в аккаунт</a>
+</p>
+<p style="margin:0 0 16px;font-size:14px;">Забыли пароль? <a href="{{ reset_url }}">Восстановить доступ</a></p>
+<p style="margin:0;color:#4b5563;font-size:14px;">Если это были не вы, ничего делать не нужно: ваш аккаунт не изменился.</p>
+{% endblock %}

@@ -1,0 +1,55 @@
+[importlinter]
+root_package = messunjerr
+include_external_packages = False
+
+# Граф зависимостей контекстов из backend-v2-spec 4.2: стрелка значит «может импортировать».
+# Слои идут сверху вниз; верхний слой видит нижние, соседи через « | » друг друга не видят.
+# Правила «чужой контекст только через api_public» добавляются вместе с первым кодом контекста.
+[importlinter:contract:layers]
+name = Контексты зависят только вниз по графу 4.2
+type = layers
+layers =
+    messunjerr.realtime | messunjerr.moderation
+    messunjerr.chat | messunjerr.content | messunjerr.notifications
+    messunjerr.media | messunjerr.social
+    messunjerr.profiles
+    messunjerr.identity
+    messunjerr.core
+
+# Раскладка внутри контекста (4.4): роутеры вызывают команды и запросы, те работают через
+# репозитории и модели, а предметные правила (domain) ни от чего из этого не зависят.
+# Команды и запросы не импортируют api/. Каждый следующий контекст добавляет такой же контракт.
+[importlinter:contract:identity-layers]
+name = Внутри identity: api, commands, queries, infra, domain
+type = layers
+containers =
+    messunjerr.identity
+layers =
+    api
+    commands
+    queries
+    infra
+    domain
+
+# Точки сборки (приложение, CLI, фоновые процессы) собирают контексты, но не наоборот.
+[importlinter:contract:roots]
+name = Ядро и контексты не импортируют точки сборки
+type = forbidden
+source_modules =
+    messunjerr.core
+    messunjerr.identity
+    messunjerr.profiles
+    messunjerr.social
+    messunjerr.content
+    messunjerr.chat
+    messunjerr.notifications
+    messunjerr.media
+    messunjerr.moderation
+    messunjerr.realtime
+forbidden_modules =
+    messunjerr.main
+    messunjerr.cli
+    messunjerr.system
+    messunjerr.jobs
+    messunjerr.consumers
+    messunjerr.relay

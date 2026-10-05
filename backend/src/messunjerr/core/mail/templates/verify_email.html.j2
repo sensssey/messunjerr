@@ -1,0 +1,15 @@
+{% extends "_base.html.j2" %}
+{% block title %}Подтвердите адрес электронной почты{% endblock %}
+{% block heading %}Подтвердите адрес электронной почты{% endblock %}
+{% block content %}
+<p style="margin:0 0 16px;">Здравствуйте! Чтобы завершить регистрацию в {{ app_name }}, подтвердите адрес электронной почты.</p>
+<p style="margin:0 0 24px;">
+  <a href="{{ verify_url }}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Подтвердить адрес</a>
+</p>
+<p style="margin:0 0 8px;color:#4b5563;font-size:14px;">Если кнопка не работает, откройте ссылку:</p>
+<p style="margin:0 0 16px;font-size:14px;word-break:break-all;"><a href="{{ verify_url }}">{{ verify_url }}</a></p>
+<p style="margin:0 0 8px;color:#4b5563;font-size:14px;">Или введите код подтверждения вручную:</p>
+<p style="margin:0 0 16px;font-family:Consolas,Menlo,monospace;font-size:14px;word-break:break-all;">{{ token }}</p>
+<p style="margin:0 0 16px;color:#4b5563;font-size:14px;">Ссылка и код действуют {{ ttl_hours }} ч и работают один раз.</p>
+<p style="margin:0;color:#4b5563;font-size:14px;">Если вы не регистрировались в {{ app_name }}, просто проигнорируйте это письмо: без подтверждения аккаунт не будет активирован.</p>
+{% endblock %}

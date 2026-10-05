@@ -13,3 +13,15 @@ __pycache__/
 
 # Node
 node_modules/
+
+# Инструменты Python (v2)
+.ruff_cache/
+.import_linter_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+
+# Секреты локального стека v2 (создаются `make init`)
+deploy/.env
