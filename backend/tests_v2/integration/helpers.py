@@ -17,6 +17,7 @@ from messunjerr.core.jobs import InMemoryJobQueue
 from messunjerr.core.mail import render_email
 from messunjerr.core.ratelimit import load_buckets
 from messunjerr.main import create_app
+from messunjerr.media.domain.ports import ObjectStorage
 from messunjerr.settings import Settings
 
 PASSWORD = "correct horse battery staple"
@@ -168,6 +169,7 @@ async def limited_client(
     jobs: InMemoryJobQueue,
     *,
     windows: dict[str, int] | None = None,
+    storage: ObjectStorage | None = None,
     **limits: int,
 ) -> AsyncGenerator[tuple[FastAPI, httpx.AsyncClient]]:
     """Приложение с включёнными лимитами; `limits` меняют ёмкость бакетов, `windows` их окна (секунды)."""
@@ -180,7 +182,7 @@ async def limited_client(
         for name, config in load_buckets().items()
     }
     settings = test_settings.model_copy(update={"rate_limits_enabled": True})
-    application = create_app(settings, job_queue=jobs, rate_limits=buckets)
+    application = create_app(settings, job_queue=jobs, rate_limits=buckets, storage=storage)
     async with LifespanManager(application):
         transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
@@ -189,10 +191,16 @@ async def limited_client(
 
 @asynccontextmanager
 async def client_with(
-    test_settings: Settings, jobs: InMemoryJobQueue, **overrides: Any
+    test_settings: Settings,
+    jobs: InMemoryJobQueue,
+    *,
+    storage: ObjectStorage | None = None,
+    **overrides: Any,
 ) -> AsyncGenerator[httpx.AsyncClient]:
     """Приложение с другими настройками (`min_age`, паузой смены ника и т.п.); лимиты остаются выключены."""
-    application = create_app(test_settings.model_copy(update=overrides), job_queue=jobs)
+    application = create_app(
+        test_settings.model_copy(update=overrides), job_queue=jobs, storage=storage
+    )
     async with LifespanManager(application):
         transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:

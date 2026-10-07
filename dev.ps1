@@ -11,7 +11,7 @@
 # Именованных параметров нет намеренно: PowerShell сопоставляет сокращения (`-c` с `-Cmd`) и украл бы
 # флаги pytest и psql. Все токены приходят в $args как есть.
 $Cmd = if ($args.Count -gt 0) { [string]$args[0] } else { 'help' }
-$Rest = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)] | ForEach-Object { [string]$_ }) } else { @() }
+[string[]]$Rest = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)] | ForEach-Object { [string]$_ }) } else { @() }
 
 Set-Location -LiteralPath $PSScriptRoot
 
@@ -27,6 +27,32 @@ function Invoke-Compose { Invoke-Docker @ComposeArgs @args }
 function Invoke-Tools { Invoke-Compose run --rm tools @args }
 # Без базы и Redis: для линтеров и проверки типов.
 function Invoke-ToolsIsolated { Invoke-Compose run --rm --no-deps tools @args }
+
+# Prod-подобный стенд (S4): отдельный проект Compose и отдельные тома, dev-стек не затрагивается.
+$StandArgs = @('compose', '-p', 'messunjerr-stand', '-f', 'deploy/compose.yml')
+function Invoke-Stand { Invoke-Docker @StandArgs @args }
+
+# Скрипты выкладки, копий и дымового теста написаны на bash (на сервере S21 их запускает CD по SSH).
+# На Windows берём bash из Git, а не из WSL: `bash` в PATH может оказаться пустым лаунчером WSL.
+function Get-Bash {
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) {
+        $candidate = Join-Path (Split-Path (Split-Path $git.Source)) 'bin\bash.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    $fallback = 'C:\Program Files\Git\bin\bash.exe'
+    if (Test-Path -LiteralPath $fallback) { return $fallback }
+    return 'bash'
+}
+function Invoke-Bash {
+    & (Get-Bash) @args
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+function Export-StandCa {
+    New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot 'deploy/.stand') | Out-Null
+    Invoke-Stand cp caddy:/data/caddy/pki/authorities/local/root.crt deploy/.stand/root.crt
+}
 
 function Get-EnvValue([string]$Name, [string]$Default) {
     $file = Join-Path $PSScriptRoot 'deploy/.env'
@@ -68,6 +94,25 @@ function Show-Help {
   redis-cli   redis-cli в Redis разработки
   shell       bash в контейнере с инструментами
   lock        обновить backend/uv.lock после правки зависимостей
+
+Prod-подобный стенд (S4: Caddy, лимиты VPS, SeaweedFS, pgBackRest; https://messunjerr.localhost):
+
+  up-prod-like     создать секреты, собрать и поднять стенд, выгрузить корневой сертификат Caddy
+  down-prod-like   остановить стенд (данные сохраняются)
+  reset-prod-like  остановить стенд и удалить ЕГО тома (dev-стек не затрагивается)
+  ps-prod-like     состояние сервисов стенда
+  logs-prod-like   логи стенда (./dev.ps1 logs-prod-like caddy; по умолчанию api-a)
+  stand-test       тесты стенда через Caddy (аргументы pytest: ./dev.ps1 stand-test -k media)
+  stand-ca         выгрузить корневой сертификат Caddy и показать, как ему доверять
+  stand-stats      память и ядра контейнеров стенда против лимитов VPS
+  stand-reset-limits  сбросить счётчики лимитов запросов в Redis стенда
+  smoke            дымовой тест стенда
+  deploy           выкладка без простоя (./dev.ps1 deploy [тег] [--no-probe])
+  rollback         откат на предыдущую выкладку
+  rehearse-migration  репетиция выкладки и отката с настоящей новой ревизией Alembic
+  backup           копия pgBackRest по требованию (./dev.ps1 backup [full|diff|incr])
+  backup-status    список копий и возраст последней
+  restore-drill    учение: восстановление копии на отдельной БД и проверка
 '@ | Write-Host
 }
 
@@ -120,6 +165,39 @@ switch ($Cmd) {
     'psql' { Invoke-Compose exec postgres psql -U postgres -d (Get-EnvValue 'DB_NAME' 'messunjerr') }
     'redis-cli' { Invoke-Compose exec redis sh -c 'redis-cli -a $REDIS_PASSWORD --no-auth-warning' }
     'shell' { Invoke-Tools bash }
+    'up-prod-like' { Invoke-Bash deploy/up.sh }
+    'down-prod-like' { Invoke-Stand down }
+    'reset-prod-like' {
+        # --profile '*': сервисы учений и тестов (drill, tools) тоже входят в проект, иначе их тома не удалить.
+        Invoke-Stand --profile '*' down -v --remove-orphans
+        # Состояние выкладки относилось к удалённым томам: следующий подъём начнётся с тега local.
+        foreach ($name in 'current_tag', 'previous_tag', 'pending') {
+            Remove-Item -LiteralPath (Join-Path $PSScriptRoot "deploy/.stand/$name") -ErrorAction SilentlyContinue
+        }
+    }
+    'ps-prod-like' { Invoke-Stand ps -a }
+    'logs-prod-like' {
+        $services = if ($Rest.Count -gt 0) { $Rest } else { @('api-a') }
+        Invoke-Stand logs -f --tail=100 @services
+    }
+    'stand-test' { Invoke-Stand run --rm stand-tools pytest -c pyproject.toml tests_v2/stand @Rest }
+    'stand-ca' {
+        Export-StandCa
+        Write-Host 'Корневой сертификат внутреннего центра Caddy: deploy/.stand/root.crt'
+        Write-Host 'Доверять ему нужно один раз (это решение за вами, скрипт ничего в систему не ставит):'
+        Write-Host '  Windows (Chrome, Edge, Яндекс.Браузер): certutil -addstore -user Root deploy\.stand\root.crt'
+        Write-Host '  Firefox: Настройки, Приватность и защита, Сертификаты, Просмотр сертификатов, Центры сертификации, Импортировать'
+        Write-Host 'Убрать: certutil -delstore -user Root "Caddy Local Authority - 2026 ECC Root" (имя смотрите в certmgr.msc)'
+    }
+    'stand-stats' { Invoke-Bash deploy/stand-stats.sh }
+    'stand-reset-limits' { Invoke-Bash deploy/reset-limits.sh }
+    'smoke' { Invoke-Bash deploy/smoke.sh @Rest }
+    'deploy' { Invoke-Bash deploy/rollout.sh deploy @Rest }
+    'rollback' { Invoke-Bash deploy/rollout.sh rollback @Rest }
+    'rehearse-migration' { Invoke-Bash deploy/rehearse-migration.sh }
+    'backup' { Invoke-Stand exec -T pgbackrest /bin/sh /backup/now.sh @Rest }
+    'backup-status' { Invoke-Stand exec -T pgbackrest /bin/sh /backup/status.sh }
+    'restore-drill' { Invoke-Bash deploy/restore-drill.sh }
     'lock' {
         $backend = Join-Path $PSScriptRoot 'backend'
         Invoke-Compose run --rm --no-deps `

@@ -53,3 +53,8 @@ on_unavailable = "allow"
 limit = 120
 window = "1m"
 on_unavailable = "allow"
+
+[upload_init]              # POST /media/uploads: начало загрузки файла, по пользователю
+limit = 60
+window = "1h"
+on_unavailable = "allow"

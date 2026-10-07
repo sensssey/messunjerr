@@ -19,6 +19,11 @@ QUEUES: tuple[str, ...] = (QUEUE_EMAIL, QUEUE_DEFAULT, QUEUE_MEDIA)
 TASK_SEND_EMAIL = "send_email"
 TASK_CLEANUP_UNVERIFIED_ACCOUNTS = "cleanup_unverified_accounts"
 TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY = "cleanup_tokens_and_idempotency"
+TASK_PROCESS_MEDIA = "process_media"
+TASK_DELETE_MEDIA_OBJECTS = "delete_media_objects"
+TASK_CLEANUP_PENDING_UPLOADS = "cleanup_pending_uploads"
+TASK_RECONCILE_UPLOADS = "reconcile_uploads"
+TASK_SWEEP_ORPHAN_OBJECTS = "sweep_orphan_objects"
 
 
 class JobQueue(Protocol):

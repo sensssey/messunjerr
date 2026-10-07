@@ -13,6 +13,12 @@ from messunjerr.identity.api.schemas import (
     UsernameResponse,
 )
 from messunjerr.identity.queries.models import MeUser
+from messunjerr.media.api.schemas import (
+    CompleteUploadResponse,
+    InitUploadRequest,
+    InitUploadResponse,
+)
+from messunjerr.media.queries.models import Asset, Quota
 from messunjerr.profiles.api.schemas import UpdatePrivacyRequest, UpdateProfileRequest
 from messunjerr.profiles.queries.models import UserProfile
 
@@ -27,6 +33,11 @@ MODELS: list[type[BaseModel]] = [
     DeleteAccountRequest,
     UsernameResponse,
     DeletionScheduledResponse,
+    InitUploadRequest,
+    InitUploadResponse,
+    CompleteUploadResponse,
+    Asset,
+    Quota,
 ]
 
 
@@ -37,7 +48,7 @@ def examples_of(model: type[BaseModel]) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("model", MODELS, ids=lambda model: model.__name__)
-def test_every_model_of_the_s3_endpoints_has_an_example(model: type[BaseModel]) -> None:
+def test_every_model_of_the_documented_endpoints_has_an_example(model: type[BaseModel]) -> None:
     assert examples_of(model), f"у {model.__name__} нет примера для OpenAPI"
 
 

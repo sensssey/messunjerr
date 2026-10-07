@@ -90,7 +90,7 @@ jobs:
           --health-retries 20
       # Сквозной тест письма: API -> arq -> воркер -> SMTP -> Mailpit.
       mailpit:
-        image: axllent/mailpit:latest
+        image: axllent/mailpit:v1.31.4
         ports:
           - 1025:1025
           - 8025:8025
@@ -118,6 +118,18 @@ jobs:
           cache-dependency-glob: backend/uv.lock
       - name: Зависимости
         run: uv sync --frozen --group dev
+      # Хранилище файлов для тестов медиа (S5): тот же образ и те же флаги, что в dev-стеке (всё, кроме
+      # S3, слушает 127.0.0.1). Без него тесты test_media_s3.py пропускаются.
+      - name: SeaweedFS (S3 для тестов медиа)
+        working-directory: .
+        run: |
+          python3 scripts/init_env.py
+          docker compose -f deploy/compose.dev.yml up -d --wait seaweedfs
+          {
+            echo "S3_ENDPOINT_INTERNAL=http://127.0.0.1:8333"
+            echo "S3_ACCESS_KEY=$(sed -n 's/^S3_APP_ACCESS_KEY=//p' deploy/.env)"
+            echo "S3_SECRET_KEY=$(sed -n 's/^S3_APP_SECRET_KEY=//p' deploy/.env)"
+          } >> "$GITHUB_ENV"
       # Включает тесты «миграции с нуля до head» и `alembic check` (tests_v2/integration).
       - name: Тесты
         run: uv run pytest -c pyproject.toml tests_v2 -ra
@@ -133,3 +145,35 @@ jobs:
         run: docker run --rm messunjerr-v2:ci python -m messunjerr --help
       - name: Образ работает не от root
         run: test "$(docker run --rm messunjerr-v2:ci id -u)" != "0"
+
+  stand-config:
+    name: Конфигурация стенда (Compose, Caddy, скрипты)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Секреты (случайные, только для проверки) и env разработки
+        run: |
+          python3 scripts/init_prod_like.py
+          python3 scripts/init_env.py
+      - name: Compose стенда и dev-стека разбираются
+        run: |
+          docker compose -p messunjerr-stand -f deploy/compose.yml config -q
+          docker compose -f deploy/compose.dev.yml config -q
+      - name: Caddyfile для стенда и для боевого сервера валиден
+        run: |
+          docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -e SITE_ADDRESS=example.ru -e TLS_MODE=tls_auto -e ACME_EMAIL=admin@example.ru \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Caddyfile отформатирован (caddy fmt)
+        run: |
+          docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
+            caddy fmt /etc/caddy/Caddyfile | diff -u deploy/Caddyfile - \
+            || { echo "::error::выполните caddy fmt --overwrite deploy/Caddyfile"; exit 1; }
+      - name: Журналы Caddy (доступа, ошибок, служебный) скрывают ticket и подписи
+        run: |
+          docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
+            caddy adapt --config /etc/caddy/Caddyfile | python3 scripts/check_caddy_logging.py
+      - name: Скрипты выкладки, копий и SeaweedFS (shellcheck)
+        run: shellcheck -x -S warning deploy/*.sh deploy/backup/*.sh deploy/seaweedfs/*.sh deploy/postgres/*.sh

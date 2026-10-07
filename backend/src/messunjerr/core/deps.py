@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from messunjerr.core.jobs import JobQueue
 from messunjerr.core.ratelimit import RateLimiter
+from messunjerr.core.shutdown import ShutdownGate
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.settings import Settings
 
@@ -27,6 +28,7 @@ class AppResources:
     jobs: JobQueue
     limiter: RateLimiter
     expected_head: str | None
+    shutdown: ShutdownGate
 
 
 def get_resources(request: Request) -> AppResources:

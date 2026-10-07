@@ -1,0 +1,7 @@
+# Скрипты и конфиги, которые монтируются в Linux-контейнеры, всегда с LF: на Windows с
+# core.autocrlf=true они иначе получат CRLF и перестанут запускаться (`/bin/sh^M: not found`).
+*.sh text eol=lf
+Makefile text eol=lf
+deploy/Caddyfile text eol=lf
+deploy/**/*.conf text eol=lf
+deploy/**/*.yml text eol=lf

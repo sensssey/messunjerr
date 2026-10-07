@@ -1,0 +1,194 @@
+# Caddyfile стенда и боевого сервера (backend-v2-spec 4.16 и 6.2). Один файл на оба окружения;
+# отличия задаются переменными окружения контейнера:
+#
+#   SITE_ADDRESS   домен: стенд `messunjerr.localhost` (браузеры сами ведут *.localhost на 127.0.0.1),
+#                  боевой сервер настоящий домен
+#   TLS_MODE       `tls_internal`: сертификат от внутреннего центра Caddy (стенд);
+#                  `tls_auto`: Let's Encrypt (боевой сервер, нужен ACME_EMAIL)
+#   HSTS_MAX_AGE   на стенде короткий, чтобы браузер не запомнил https для *.localhost на год
+#
+# Корневой сертификат внутреннего центра один раз доверяют в ОС и браузере: docs/runbooks/stand.md.
+
+# ⚖️ В журналы (доступа, ошибок, служебный) не попадают токены, cookie и подписи presigned URL;
+# срок хранения 90 дней. Снипет стоит выше глобальных настроек: тот, кто в них подключается,
+# должен быть описан раньше.
+(log_filter) {
+	format filter {
+		wrap json
+		fields {
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			resp_headers>Set-Cookie delete
+			request>uri query {
+				replace ticket REDACTED
+				replace X-Amz-Signature REDACTED
+				replace X-Amz-Credential REDACTED
+				replace X-Amz-Security-Token REDACTED
+			}
+		}
+	}
+}
+
+{
+	skip_install_trust
+	email {$ACME_EMAIL:admin@messunjerr.localhost}
+	servers {
+		timeouts {
+			read_header 10s
+		}
+	}
+	# Служебный журнал Caddy (TLS, перезагрузки, ошибки соединений) идёт в stderr, а журнал
+	# ошибок запросов (502, 503, 413, обрывы загрузки) с тем же фильтром в файл рядом с журналом
+	# доступа: в записи об ошибке запрос стоит целиком, с ticket и подписью presigned URL.
+	log {
+		import log_filter
+	}
+	log errors {
+		include http.log.error
+		output file /var/log/caddy/error.log {
+			roll_size 20MiB
+			roll_keep_for 2160h
+		}
+		import log_filter
+	}
+}
+
+(tls_internal) {
+	tls internal
+}
+
+(tls_auto) {
+	# сертификаты выпускаются и продлеваются автоматически
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age={$HSTS_MAX_AGE:31536000}; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		X-Frame-Options DENY
+		-Server
+	}
+}
+
+(access_log) {
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 100MiB
+			roll_keep_for 2160h
+		}
+		import log_filter
+	}
+}
+
+# Две реплики API: наименее загруженная, активная проверка /health/serving (во время слива при
+# выкладке она отвечает 503, и реплика выходит из балансировки), повтор на соседней реплике, если
+# соединение не установилось. PostgreSQL и Redis эта проверка намеренно не смотрит: общий сбой
+# зависимости не должен выводить обе реплики разом (весь /api/* отвечал бы 503 после пяти секунд
+# ожидания), реплика отвечает ошибкой сама. Ручку для проверки сначала выкатывают релизом, и только
+# потом Caddyfile начинает её опрашивать: старые реплики отвечают на неё 404 и выпали бы из балансировки.
+(api_proxy) {
+	reverse_proxy api-a:8000 api-b:8000 {
+		lb_policy least_conn
+		lb_try_duration 5s
+		lb_try_interval 250ms
+		health_uri /health/serving
+		health_interval 2s
+		health_timeout 1s
+		health_status 2xx
+		max_fails 1
+		fail_duration 5s
+		flush_interval -1
+	}
+}
+
+{$SITE_ADDRESS:messunjerr.localhost} {
+	import {$TLS_MODE:tls_internal}
+	encode zstd gzip
+	import security_headers
+	import access_log
+
+	# Идентификатор запроса: берётся клиентский, иначе создаётся здесь (4.15).
+	@no_request_id header !X-Request-ID
+	request_header @no_request_id X-Request-ID {http.request.uuid}
+
+	# Служебные адреса снаружи недоступны. Это первый handle: ниже есть общий, который иначе
+	# отдал бы им страницу SPA.
+	@internal path /health /health/* /metrics /metrics/*
+	handle @internal {
+		respond 404
+	}
+
+	# CSP: строгая политика для всего, кроме документации OpenAPI (приложение отдаёт её только вне
+	# prod). Swagger UI берёт скрипты и стили с CDN и запускает встроенный скрипт, строгий CSP его
+	# ломает. Две политики разведены матчерами: заголовки с одним и тем же полем и разными матчерами
+	# Caddy упорядочивает по специфичности, а не по порядку в файле, и общий затёр бы частный.
+	@docs path /api/v1/docs /api/v1/docs/*
+	header @docs Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+	@not_docs not path /api/v1/docs /api/v1/docs/*
+	header @not_docs Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+
+	# Страховочный внешний предел 2 МиБ (`request_body` обрывает только тот запрос, чьё тело кто-то
+	# читает). Точный предел 1 МиБ и ответ 413 problem+json держит приложение (REQUEST_BODY_LIMIT_BYTES):
+	# оно отвечает по заголовку Content-Length, не читая тело, поэтому предел Caddy его не опережает.
+	# Caddy считает MB как 10^6 байт, MiB как 2^20: размеры пределов задаём в MiB, как и приложение.
+	handle /api/* {
+		request_body {
+			max_size 2MiB
+		}
+		import api_proxy
+	}
+
+	handle /.well-known/jwks.json {
+		import api_proxy
+	}
+
+	# SigV4 подписывает путь и Host: проксируем без переписывания, Host остаётся исходным. Имя bucket
+	# (S3_BUCKET=media) входит в путь /media/…: другое имя потребует другого маршрута, `check_runtime`
+	# этого не ловит.
+	# Анонимно читаются только `public/` (аватары), это решает SeaweedFS; сюда же писать в `public/`
+	# через Caddy не нужно никому (файлы туда кладёт воркер по внутреннему адресу).
+	handle /media/* {
+		@public_write {
+			path /media/public/*
+			not method GET HEAD
+		}
+		respond @public_write 405
+
+		# SeaweedFS принимает неподписанные заголовки о содержимом и хранит их как метаданные объекта,
+		# а при чтении отдаёт (проверено: Content-Encoding, Content-Disposition, Cache-Control, Expires,
+		# Content-Language). Подпись ссылки закрепляет только Content-Type, Content-Length и
+		# If-None-Match, браузер остальных не шлёт, поэтому запись в `uploads/` их лишается. Иначе
+		# загруженный файл сам объявил бы себя сжатым (`Content-Encoding: gzip`) и стал бы «бомбой»
+		# распаковки для того, кто его скачивает. Заголовки `X-Amz-*` без подписи хранилище отклоняет само.
+		@upload_write {
+			path /media/uploads/*
+			method PUT POST
+		}
+		request_header @upload_write -Content-Encoding
+		request_header @upload_write -Content-Disposition
+		request_header @upload_write -Content-Language
+		request_header @upload_write -Cache-Control
+		request_header @upload_write -Expires
+
+		# 26 МиБ с запасом над file_max_bytes (25 МиБ): точный размер закреплён подписью.
+		request_body {
+			max_size 26MiB
+		}
+		reverse_proxy seaweedfs:8333 {
+			flush_interval -1
+			header_down -Server
+			header_down -X-Amz-Request-Id
+			header_down -Seaweed-X-Amz-Owner
+			header_down -Seaweed-X-Amz-Etag
+		}
+	}
+
+	# Остальное: статика клиента (SPA). До S20 здесь заглушка.
+	handle {
+		root * /srv/frontend
+		try_files {path} /index.html
+		file_server
+	}
+}

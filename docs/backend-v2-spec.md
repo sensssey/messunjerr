@@ -1253,7 +1253,7 @@ sequenceDiagram
     A-->>B: 201 asset_id + presigned PUT
     B->>S3: PUT объект (через Caddy, путь /media/…)
     B->>A: POST /media/uploads/{id}/complete
-    A->>S3: HEAD (размер, etag)
+    A->>S3: HEAD (размер)
     A->>PG: статус uploaded + outbox AssetUploaded
     A-->>B: 202
     K->>M: AssetUploaded
@@ -1271,13 +1271,19 @@ sequenceDiagram
 
 - **Тип определяется по содержимому** (сигнатура + Pillow), не по заявленному `content_type` и не по расширению. SVG и HTML отклоняются.
 - **Изображения перекодируются**: EXIF удаляется, применяется ориентация, ограничение 25 мегапикселей и защита от «бомб распаковки».
-- **Файлы** хранятся как есть, отдаются с `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, имя файла очищается.
-- **Квота** 1 ГБ на пользователя по сумме `size_bytes` готовых ресурсов; превышение: `quota_exceeded`.
+- **Файлы** хранятся как есть, отдаются с `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, имя файла очищается. В хранилище они лежат с типом `application/octet-stream`, какой бы тип ни заявил клиент (иначе хранилище отдало бы загруженное как `text/html` или SVG): заявленный тип остаётся в карточке, а подпись ссылки закрепляет именно `application/octet-stream`. Исполняемые файлы (PE, ELF, Mach-O, класс Java) отклоняются по содержимому: `forbidden_type`.
+- **Квота** 1 ГБ на пользователя по сумме `size_bytes` готовых ресурсов **плюс заявленный размер идущих загрузок** (`pending`, `uploaded`, `processing`): иначе параллельные заявки обошли бы предел. Заявка и подсчёт идут под блокировкой владельца (`pg_advisory_xact_lock`), так что две одновременные заявки не пройдут в одну и ту же свободную дыру. Превышение: `quota_exceeded`. Место освобождают удаление, отклонение и очистка незавершённой загрузки.
 - **Доступ:** публичны только аватары (стабильные адреса вида `/media/public/avatars/{asset_id}/{size}.webp`, непредсказуемые идентификаторы). Остальные ссылки — presigned GET на 10 минут, которые API подставляет в ответы и пересоздаёт при каждой выдаче; в ответе есть `url_expires_at`.
-- **Очистка:** загрузки в `pending` и `uploaded` старше 24 часов и неприкреплённые `ready` старше 48 часов удаляет почасовая задача; при удалении поста, сообщения или аккаунта объекты удаляются отдельной задачей.
+- **Очистка:** загрузки в `pending` старше 24 часов от заявки, а в `uploaded` и `processing` старше 24 часов от завершения загрузки (`PENDING_UPLOAD_TTL_HOURS`; файл, который ждёт упавший воркер, не пропадает через сутки после заявки) и неприкреплённые `ready` старше 48 часов удаляет почасовая задача; при удалении поста, сообщения или аккаунта объекты удаляются отдельной задачей. Неприкреплённые `ready` задача начнёт чистить вместе с первыми привязками (аватар S6, вложения S11 и S14): пока знать, прикреплён ли ресурс, нечем.
+- **Запись один раз (S5).** В подпись ссылки входит условие `If-None-Match: *` (заголовок есть в `upload.headers`): объект создаётся один раз, второй `PUT` по той же ссылке получает `412 PreconditionFailed` (проверено на SeaweedFS 4.47, в том числе через Caddy). Без него клиент мог бы подменить файл после проверки (размер смотрит `complete`, сигнатуру `process_media`): положить другое содержимое того же размера, пока ссылка жива. Условие подписано, поэтому убрать заголовок нельзя (`403`). Клиенту, у которого повтор `PUT` получил `412`, остаётся вызвать `complete`: файл уже на месте.
+- **Окно ссылки при удалении (S5).** Условная запись не мешает создать объект заново, когда прежний уже удалён: клиент, не потерявший ссылку, может положить файл после `DELETE /media/{id}` или отказа, и такой объект не учтён ни в какой квоте. Поэтому `delete_media_objects` убирает объекты сразу, а отметку `objects_deleted_at` ставит, только когда ссылка заведомо протухла (`UPLOAD_URL_TTL_SECONDS` и минута запаса от создания заявки); до тех пор `reconcile_uploads` повторяет удаление каждые 5 минут. Для ресурсов старше этого срока (очистка незавершённых, поздние удаления) хватает одного прохода. Объект, который всё же появился позже (`PUT` с медленным телом, начатый до истечения ссылки, дописался после зачистки; удаление аккаунта каскадом убрало строки), убирает **суточная сверка** `sweep_orphan_objects` (4.12): она листает префикс `uploads/` и удаляет объекты старше часа, у которых нет живого ресурса. За запуск удаляется не больше 500 объектов: ошибка настройки (БД не та, что у хранилища) не должна стереть всё разом.
+- **Неподписанные заголовки (S5).** SeaweedFS отклоняет неподписанные `X-Amz-*` (`X-Amz-Copy-Source`, `X-Amz-Acl`, `X-Amz-Meta-*`: `403`), но принимает неподписанные `Content-Encoding`, `Content-Disposition`, `Cache-Control`, `Expires`, `Content-Language`, сохраняет их как метаданные объекта и отдаёт при чтении (проверено): загруженный файл мог бы сам объявить себя сжатым и стать «бомбой» распаковки для того, кто его скачивает. Поэтому Caddy срезает эти пять заголовков у `PUT` под `/media/uploads/*` (браузер их не шлёт, подпись их не закрепляет), а выдача файлов (S6, S14) обязана задавать заголовки ответа сама (`ResponseContentType`, `ResponseContentDisposition`, `ResponseCacheControl`) и не полагаться на сохранённые метаданные.
+- **Состояние объектов и временная схема до Kafka (S5).** Строки `deleted` и `rejected` хранят отметку `objects_deleted_at`: пока её нет, объекты ещё лежат в хранилище. Задачи `process_media` и `delete_media_objects` ставятся напрямую после коммита, а `reconcile_uploads` (каждые 5 минут) подбирает те, что потерялись при сбое Redis или смерти воркера: загрузки в `uploaded` и `processing`, до которых обработка не дошла, и строки с неубранными объектами. Недоступное хранилище файл не отклоняет и не стирает: после последней попытки задача сдаётся, ресурс остаётся в `processing`, сверка повторяет обработку, а через сутки очистка удаляет застрявшую загрузку; `processing_failed` ставится, только когда объекта в хранилище нет. События `AssetUploaded`, `AssetProcessed`, `AssetRejected`, `AssetDeleted` пишутся в outbox уже сейчас (без имени файла), ретранслятор и потребители придут в S9–S10.
+- **Обработка в S5 (заглушка).** `process_media` читает первые 4 КиБ объекта и решает по сигнатуре: JPEG, PNG, WebP, GIF принимаются (GIF не для аватара), SVG, HTML и неопознанное под видом изображения дают `not_an_image`, BMP, TIFF, HEIC и подобные `unsupported_format`, исполняемые файлы `forbidden_type`; тип записывается по содержимому. Перекодирование, EXIF, варианты, лимит мегапикселей и защита от «бомб» добавит S6; ресурсы, прошедшие заглушку, S6 перегонит (у них `variants = {}`).
+- **Таблица `media.assets`** отличается от DDL в 4.5: индекс `ix_assets_owner` без `DESC` (PostgreSQL читает его и назад), столбцы `deleted_at` и `objects_deleted_at`, индексы `ix_assets_reconcile` и `ix_assets_objects_pending` для плановых задач; внешний ключ `profile.profiles.avatar_asset_id` создаёт та же миграция 0004.
 - ⚖️ **Метаданные изображений:** EXIF, включая геометки и модель устройства, удаляется всегда: это персональные данные, которые человек не собирался публиковать.
 - ⚖️ **Выгрузка данных пользователя** (4.20) лежит в том же bucket под непубличным префиксом `exports/{user_id}/{export_id}.zip`, отдаётся presigned-ссылкой на 24 часа и удаляется через `DATA_EXPORT_TTL_DAYS` (по умолчанию 7).
-- ⚠️ **Подпись SigV4 включает путь и заголовок `Host`**, поэтому Caddy проксирует `/media/*` в SeaweedFS **без переписывания пути**, а bucket называется `media` (path-style адресация на том же домене). Это нужно подтвердить коротким экспериментом (spike) в этапе 0, включая загрузку из браузера.
+- ⚠️ **Подпись SigV4 включает путь и заголовок `Host`**, поэтому Caddy проксирует `/media/*` в SeaweedFS **без переписывания пути**, а bucket называется `media` (path-style адресация на том же домене). ✅ Подтверждено спайком S4-05 (итоги S4, п. 1 плана спринтов): подпись проходит через Caddy из браузера, в presigned PUT подписываются `Content-Type` и `Content-Length` (тип и точный размер закрепляются подписью; с S5 ещё и `If-None-Match: *`, запись один раз), анонимно читается только `public/`, флаг SeaweedFS `-s3.externalUrl` не нужен.
 
 ### 4.12. Фоновые задачи (arq)
 
@@ -1286,9 +1292,11 @@ sequenceDiagram
 | Задача | Запуск | Очередь | Повторы | Назначение |
 |---|---|---|---|---|
 | `send_email` | по событию | `email` | 5, экспонента от 30 с | письма подтверждения, сброса, уведомления безопасности, уведомления пользователю |
-| `process_media` | по `AssetUploaded` | `media` | 3, тайм-аут 120 с | сигнатура, EXIF, варианты, статус |
-| `delete_media_objects` | по событиям удаления | `media` | 5 | удаление объектов из хранилища |
+| `process_media` | по `AssetUploaded` (до Kafka напрямую после коммита) | `media` | 3, пауза 30 и 60 с, тайм-аут 120 с | сигнатура, EXIF, варианты, статус; `processing_failed` только если объекта нет, при недоступном хранилище задача после последней попытки сдаётся, ресурс остаётся в `processing`, его повторяет `reconcile_uploads` |
+| `delete_media_objects` | по событиям удаления | `media` | 5, пауза от 30 с, тайм-аут 120 с | удаление объектов из хранилища; строку закрывает отметкой, когда протухла ссылка на загрузку (4.11) |
 | `cleanup_pending_uploads` | cron, каждый час | `default` | — | незавершённые и неприкреплённые загрузки |
+| `reconcile_uploads` | cron, каждые 5 минут | `default` | — | 🧱 временно, до Kafka: заново ставит потерянные `process_media` и `delete_media_objects` (детерминированный `job_id`, дублей нет) |
+| `sweep_orphan_objects` | cron, 04:20 UTC | `default` | — | объекты `uploads/` без живого ресурса (старше часа, не больше 500 за запуск); воркеру `default` для этого нужен доступ к хранилищу |
 | `cleanup_sessions` | cron, раз в сутки | `default` | — | истёкшие и давно отозванные сессии (>30 дней) |
 | `cleanup_tokens_and_idempotency` | cron, каждый час | `default` | — | просроченные письменные токены и ключи идемпотентности |
 | `outbox_housekeeping` | cron, каждый час | `default` | — | удаление опубликованных строк старше 7 дней |
@@ -1399,7 +1407,7 @@ Redis хранит только эфемерное и очередь arq. Нас
 | `request_id` | берётся из `X-Request-ID` (Caddy добавляет, если нет), возвращается в ответе и в `problem+json`, попадает в заголовки Kafka |
 | Ошибки ⚖️ | клиент `sentry-sdk`, отправка в самохостинговый GlitchTip в РФ; трассировка 5%; релиз = git sha; `send_default_pii=False`, в `before_send` вырезаются email, IP, токены и тела запросов; срок хранения событий 30 дней |
 | Метрики `/metrics` | формат Prometheus, доступ только из внутренней сети (Caddy отдаёт 404 снаружи) |
-| Здоровье | `GET /health/live` (процесс жив), `GET /health/ready` (PostgreSQL и Redis доступны, миграции на `head`; Kafka и реестр отражаются как `degraded`, но не валят готовность: outbox накапливает события) |
+| Здоровье | `GET /health/live` (процесс жив), `GET /health/serving` (принимает трафик: `200`, пока процесс не сливается при остановке; зависимости не проверяет, по ней Caddy выводит реплику из балансировки), `GET /health/ready` (PostgreSQL и Redis доступны, миграции на `head` либо БД впереди кода (`ahead`: выкладка с миграцией); Kafka и реестр отражаются как `degraded`, но не валят готовность: outbox накапливает события) |
 
 Метрики: `http_requests_total{route,method,status}`, `http_request_duration_seconds`, `ws_connections`, `sse_streams`, `db_pool_in_use`, `outbox_oldest_unpublished_age_seconds`, `kafka_consumer_lag{group,topic}`, `arq_queue_depth{queue}`, `arq_jobs_failed_total{job}`, `rate_limited_total{bucket}`, `auth_failures_total{reason}`, `media_processing_seconds`, `notifications_created_total{type}`.
 
@@ -1412,20 +1420,26 @@ Redis хранит только эфемерное и очередь arq. Нас
 | Сервис | Образ | Реплик | Проверка | Память |
 |---|---|:---:|---|---:|
 | `caddy` | `caddy:2` | 1 | — | 128 МБ |
-| `api-a`, `api-b` | собственный | 2 | `GET /health/ready` | 512 МБ |
-| `worker` | собственный | 1 (+1 с ролью cron) | `arq --check` | 512 МБ |
+| `api-a`, `api-b` | собственный | 2 | `/health/live` (Docker), `/health/serving` (Caddy), `/health/ready` (выкладка, мониторинг) | 512 МБ |
+| `worker`, `worker-default`, `worker-media` | собственный | по 1 (очереди `email`, `default` и `media`; плановые задачи на `default`) | `arq --check` | 256 МБ каждый (`worker-media` получит больше вместе с Pillow, S6) |
 | `relay` | собственный | 1 | heartbeat в метрике | 256 МБ |
 | `consumer-notifier`, `consumer-media` | собственный | по 1 | heartbeat | 256 МБ |
-| `migrate` | собственный | одноразовая задача | код возврата | — |
-| `postgres` | `postgres:18` | 1 | `pg_isready` | 2 ГБ |
+| `db-init` | собственный | одноразовая задача (роли и база, нужен суперпользователь; выкладка её не запускает) | код возврата | — |
+| `migrate` | собственный | одноразовая задача (под ролью `migrator`, отдельным шагом выкладки) | код возврата | — |
+| `postgres` | `postgres:18` с пакетом pgBackRest | 1 | `pg_isready` | 2 ГБ |
+| `pgbackrest` | тот же образ | 1 (sidecar с общим каталогом данных) | возраст последней копии ≤ 26 ч | 256 МБ |
 | `redis` | `redis:8` | 1 | `redis-cli ping` | 384 МБ |
 | `kafka` | `apache/kafka:4.x` | 1 | `kafka-broker-api-versions` | 1,5 ГБ |
 | `schema-registry` | `ghcr.io/aiven-open/karapace` | 1 | HTTP-проверка | 512 МБ |
 | `glitchtip` (+ worker) | `glitchtip/glitchtip` | 1, профиль `obs` | HTTP-проверка | 512 МБ |
-| `seaweedfs` | `chrislusf/seaweedfs` | 1 | `/cluster/status` | 768 МБ |
+| `seaweedfs` | собственный на основе `chrislusf/seaweedfs:4.47` (добавлен `socat`) | 1 | `/healthz`, `/cluster/status`, buckets на месте | 768 МБ |
 | `mailpit` | `axllent/mailpit` | только dev | — | — |
 
-Все контейнеры в одной внутренней сети; наружу публикует порты только Caddy (80, 443 TCP и UDP для HTTP/3).
+Сети: `edge` (Caddy), `internal` (с флагом `internal: true`, без выхода наружу: PostgreSQL, Redis, SeaweedFS, все сервисы) и `egress` (API и воркеры); наружу публикует порты только Caddy (80, 443 TCP и UDP для HTTP/3; на стенде ещё веб-интерфейс Mailpit на `127.0.0.1:8026`, для него Mailpit стоит и в `edge`: Docker не публикует порты сети без выхода наружу). У SeaweedFS нет аутентификации ни у master, volume и filer, ни у gRPC (через gRPC S3 любой сосед по сети создаёт себе администратора), поэтому внутри контейнера они слушают только `127.0.0.1`, а в `internal` виден лишь S3 (8333 по HTTP и 8334 по HTTPS для pgBackRest), его выставляет наружу `socat`. Лимиты памяти задаются на каждый контейнер (своп выключен), все контейнеры делят ядра 0-3 (`cpuset`), как у VPS на 4 vCPU.
+
+**Остановка без простоя (S4-03).** По SIGTERM процесс сначала сливает трафик: `/health/serving` и `/health/ready` отвечают `503` (`/health/live` остаётся 200), активная проверка Caddy `/health/serving` (каждые 2 с) снимает реплику с балансировки, SSE заканчивается событием `bye`, WebSocket закрывается кодом 1001 (клиент переподключается к соседней реплике); спустя `SHUTDOWN_DRAIN_SECONDS` (на стенде и в проде 5 с) uvicorn перестаёт принимать соединения и дожидается текущих запросов до `SHUTDOWN_TIMEOUT_SECONDS` (20 с); `stop_grace_period` контейнера 30 с. Выкладка (`deploy/rollout.sh`) идёт так: образ, миграции отдельной задачей, `api-a`, `api-b` по одной, воркеры, дымовой тест; при сбое автоматический возврат на прошлый тег. Проверка Caddy не зависит от PostgreSQL и Redis: общий сбой зависимости не должен выводить обе реплики разом (иначе весь `/api/*` отвечал бы `503` после пяти секунд ожидания), реплика отвечает ошибкой сама.
+
+**Миграции и готовность (S4).** Миграции назад не откатываются: схема обязана быть совместимой с обоими версиями кода («расширить → мигрировать → сузить»). Поэтому `/health/ready` считает ревизию БД, которой нет среди известных коду, признаком «БД новее кода» (`migrations: ahead`: старые реплики сразу после `migrate`, предыдущий код при откате) и остаётся готовым; `behind` (ревизия известна, но не последняя) готовым не бывает. Проверяет это репетиция с настоящей новой ревизией (`make rehearse-migration`): выкладка и откат против схемы «впереди» кода идут без ошибок клиентов.
 
 ⚖️ **Размещение.** VPS находится в дата-центре в РФ (в договоре с провайдером фиксируется, что данные не вывозятся; у провайдера стоит запросить документы по физической защите площадки и виртуализации, 6.9.9). Диски шифруются средствами провайдера или LUKS. DNS-зона может быть у любого провайдера (ПДн в запросах нет), но проксирование трафика через зарубежные CDN и «защитные» сервисы не используется: это передача данных за рубеж. Исходящий трафик серверов ограничен списком (сетевые правила Compose и фильтр на хосте): SMTP/API почтового провайдера, VK ID, Яндекс ID, S3 для копий, healthchecks, серверы обновлений ОС и реестры образов на время выкладки.
 
@@ -1438,7 +1452,7 @@ Redis хранит только эфемерное и очередь arq. Нас
 
 #### Caddy
 
-Один сайт-домен: `/api/*` на API (балансировка `least_conn`, активные проверки `/health/ready`, `flush_interval -1`, динамический набор upstream'ов), `/media/*` на SeaweedFS без переписывания пути, остальное — статика SPA с `try_files … /index.html`. WebSocket Caddy проксирует автоматически, SSE (`text/event-stream`) сбрасывается сразу. Эскиз — в приложении 6.2.
+Один сайт-домен: `/api/*` на API (балансировка `least_conn`, активные проверки `/health/serving`, `flush_interval -1`, динамический набор upstream'ов), `/media/*` на SeaweedFS без переписывания пути, остальное — статика SPA с `try_files … /index.html`. WebSocket Caddy проксирует автоматически, SSE (`text/event-stream`) сбрасывается сразу. Эскиз — в приложении 6.2.
 
 #### Конвейер CI/CD (GitHub Actions)
 
@@ -1512,7 +1526,7 @@ pgBackRest: полная копия раз в неделю, дифференци
 |---|---|---|---|
 | R1 | Несовместимость aiokafka с брокером Kafka 4.x (там убраны старые версии протокола) | средняя / высокая | интеграционный тест на `apache/kafka:4.x` в этапе 0; запасной вариант: `confluent-kafka` (AIO) за интерфейсом `EventBus` или закрепление брокера на 3.9 |
 | R2 | arq перестанет выпускаться | низкая / средняя | порт `JobQueue`; замена на Taskiq или Procrastinate. ⚠️ Частично сработал в S1: arq 0.28 не поддерживает redis-py ≥ 6 по метаданным (работает с 8.1 с двумя `DeprecationWarning`); пин снят, тест-сторож `test_arq_compat` |
-| R3 | Presigned URL SeaweedFS за Caddy не заработает из браузера | средняя / средняя | spike в этапе 0; запасной вариант: отдельный поддомен для S3 или S3 российского провайдера (Selectel, Yandex Object Storage) в проде |
+| R3 ✅ | Presigned URL SeaweedFS за Caddy не заработает из браузера (закрыт в S4: работает на том же домене без переписывания пути) | средняя / средняя | spike в этапе 0; запасной вариант: отдельный поддомен для S3 или S3 российского провайдера (Selectel, Yandex Object Storage) в проде |
 | R4 | Не хватит ресурсов VPS | средняя / высокая | лимиты памяти, бюджет из 2.3; запасной вариант: временно заменить Kafka на `ArqEventBus` (outbox → arq напрямую) |
 | R5 | Единственный сервер — точка отказа | высокая / средняя | копии, инфраструктура как код, runbook; RTO 1 час |
 | R6 | Злоупотребления в публичной сети | высокая / высокая | лимиты, подтверждение почты, жалобы и блокировки; позже капча и 2FA |
@@ -2467,9 +2481,9 @@ JWKS с публичными ключами Ed25519 (`kty: OKP`, `crv: Ed25519`,
 |---|---|
 | Лимит | `upload_init`; поддерживает `Idempotency-Key` |
 | Тело | `purpose` ∈ `avatar`, `group_avatar`, `post`, `message` · `filename` (1–255, имя очищается от путей и управляющих символов) · `content_type` (заявленный тип) · `size_bytes` (больше 0 и не больше лимита назначения, см. 4.11) |
-| Успех | `201` `{ "asset": Asset (status = pending), "upload": { "method": "PUT", "url": "https://<домен>/media/…?X-Amz-…", "headers": { "Content-Type": "image/jpeg" }, "expires_at": "…" } }` |
-| Ошибки | `403 quota_exceeded` (расширения `limit`, `used`) · `422 validation_error`: `purpose_invalid`, `content_type_not_allowed`, `extension_forbidden`, `size_invalid`, `size_exceeds_limit` (в `meta.max_bytes`) |
-| Эффекты | строка `media.assets` со статусом `pending`; клиент обязан выполнить `PUT` по `upload.url` с теми же заголовками (подпись включает `Content-Type`) в течение 15 минут |
+| Успех | `201` `{ "asset": Asset (status = pending), "upload": { "method": "PUT", "url": "https://<домен>/media/…?X-Amz-…", "headers": { "Content-Type": "image/jpeg", "If-None-Match": "*" }, "expires_at": "…" } }` |
+| Ошибки | `403 quota_exceeded` (расширения `limit`, `used`) · `422 validation_error`: `purpose_invalid`, `content_type_not_allowed`, `extension_forbidden`, `size_invalid`, `size_exceeds_limit` (в `meta.max_bytes`); все найденные проблемы приходят одним ответом · `503 service_unavailable` (хранилище недоступно, `Retry-After: 5`) |
+| Эффекты | строка `media.assets` со статусом `pending`; заголовок `Location: /api/v1/media/{id}`; клиент обязан выполнить `PUT` по `upload.url` с теми же заголовками (подпись включает `Content-Type`, точный `Content-Length` и `If-None-Match: *`) в течение 15 минут. Запись происходит один раз: повторный `PUT` по той же ссылке получает от хранилища `412` (файл уже на месте, дальше `complete`). У не-изображений в `upload.headers` всегда `Content-Type: application/octet-stream` (4.11). Повтор с тем же `Idempotency-Key` возвращает ту же заявку вместе с прежней ссылкой, в том числе уже просроченной: тогда нужна новая заявка под другим ключом, а прежняя `pending` освободит квоту сама через 24 часа или по `DELETE` |
 
 Тип `kind` определяется по заявленному `content_type` (`image/jpeg`, `image/png`, `image/webp`, `image/gif` → `image`, иначе `file`); окончательное решение принимается по содержимому при обработке.
 
@@ -2479,9 +2493,9 @@ JWKS с публичными ключами Ed25519 (`kty: OKP`, `crv: Ed25519`,
 
 | | |
 |---|---|
-| Успех | `202` `{ "asset": Asset (status = uploaded) }`. Повторный вызов идемпотентен: возвращает текущее состояние |
-| Ошибки | `404 not_found` · `409 upload_missing` (объекта в хранилище нет) · `422 upload_rejected` (размер не совпал или превышен: ресурс переходит в `rejected`, объект удаляется, причина в `reason`) |
-| Эффекты | событие `AssetUploaded`; потребитель `media` ставит задачу `process_media` (4.11, 4.12); о результате сообщает SSE-событие `media.ready` или `media.rejected` |
+| Успех | `202` `{ "asset": Asset (status = uploaded) }`. Повторный вызов идемпотентен: возвращает текущее состояние, в том числе `ready` и `rejected` (с `reject_reason`) |
+| Ошибки | `404 not_found` · `409 upload_missing` (объекта в хранилище нет, ресурс остаётся `pending`: можно дозагрузить и повторить) · `422 upload_rejected` (размер не совпал или превышен: ресурс переходит в `rejected`, объект удаляется, причина в `reason`) · `503 service_unavailable` (хранилище недоступно, состояние не меняется) |
+| Эффекты | событие `AssetUploaded`; потребитель `media` ставит задачу `process_media` (4.11, 4.12); о результате сообщает SSE-событие `media.ready` или `media.rejected` (поток событий придёт в S10, до этого состояние читается опросом `GET /media/{asset_id}`) |
 
 #### `GET /media/{asset_id}` · владелец
 
@@ -2898,7 +2912,8 @@ Ticket одноразовый и живёт 30 секунд; новое подк
 | Метод и путь | Доступ | Описание |
 |---|---|---|
 | `GET /health/live` | внутренний | процесс жив: `200` `{ "status": "ok" }` |
-| `GET /health/ready` | внутренний | готовность: `200` или `503` `{ "status": "ready" \| "unavailable", "checks": { "postgres": "ok", "redis": "ok", "migrations": "head" }, "degraded": { "kafka": "ok", "schema_registry": "ok", "storage": "ok" } }`. Падение PostgreSQL или Redis даёт `503`; Kafka, реестр и хранилище попадают в `degraded` и готовность не валят |
+| `GET /health/serving` | внутренний | принимает трафик, зависимости не проверяет: `200` `{ "status": "serving" }`, при остановке (слив трафика) `503` `{ "status": "draining" }`. По ней Caddy выводит реплику из балансировки |
+| `GET /health/ready` | внутренний | готовность: `200` или `503` `{ "status": "ready" \| "unavailable", "checks": { "postgres": "ok", "redis": "ok", "migrations": "head" }, "degraded": { "kafka": "ok", "schema_registry": "ok", "storage": "ok" } }`. Падение PostgreSQL или Redis даёт `503`; Kafka, реестр и хранилище попадают в `degraded` и готовность не валят. `migrations`: `head` (последняя ревизия) или `ahead` (ревизия неизвестна коду: БД проведена более новым релизом, готовность не нарушается); `behind` (известная, но не последняя) и `unknown` дают `503`. При остановке процесса (слив) `503` с `checks: { "shutdown": "draining" }` |
 | `GET /metrics` | внутренний | метрики Prometheus (4.15) |
 | `GET /api/v1/meta` | публично | параметры для клиента, кэш 5 минут |
 | `GET /.well-known/jwks.json` | публично | ключи проверки access-токенов (5.2) |
@@ -3126,9 +3141,11 @@ Ticket одноразовый и живёт 30 секунд; новое подк
 | `MIGRATOR_DATABASE_URL`, `RETENTION_DATABASE_URL` | — | роли `migrator` и `retention` (4.16) |
 | `REDIS_URL` | — | |
 | `KAFKA_BOOTSTRAP_SERVERS`, `SCHEMA_REGISTRY_URL` | — | |
-| `S3_ENDPOINT_INTERNAL` | — | для `HEAD`, `GET`, `DELETE` из серверов (внутренняя сеть) |
+| `S3_ENDPOINT_INTERNAL` | — | для `HEAD`, `GET`, `DELETE` из серверов (внутренняя сеть); без него (и ключей) ручки загрузки отвечают `503`, а в `prod` и `stage` не стартуют API и воркеры `media` и `default` |
 | `S3_ENDPOINT_PUBLIC` | `PUBLIC_BASE_URL` | база для presigned URL: подпись SigV4 включает `Host`, поэтому ссылки подписываются публичным адресом |
-| `S3_BUCKET`, `S3_ACCESS_KEY_FILE`, `S3_SECRET_KEY_FILE` | `media` | |
+| `S3_BUCKET`, `S3_ACCESS_KEY_FILE`, `S3_SECRET_KEY_FILE` | `media` | ключи приложения (в SeaweedFS у них доступ только к bucket `media`); `S3_REGION` по умолчанию `us-east-1` |
+| `UPLOAD_URL_TTL_SECONDS` | `900` | срок действия presigned PUT (5.8: 15 минут) |
+| `PENDING_UPLOAD_TTL_HOURS` | `24` | через сколько часов незавершённая загрузка удаляется вместе с объектом (4.11) |
 | `JWT_PRIVATE_KEY_FILE`, `JWT_KEY_ID` | — | Ed25519; прежние публичные ключи остаются в JWKS на время жизни токенов |
 | `ACCESS_TOKEN_TTL_SECONDS` | `600` | |
 | `REFRESH_TTL_DAYS`, `REFRESH_ABSOLUTE_TTL_DAYS` | `30`, `90` | |
@@ -3168,10 +3185,17 @@ Ticket одноразовый и живёт 30 секунд; новое подк
 | `MEDIA_QUOTA_BYTES` | `1073741824` | |
 | `WS_MAX_CONNECTIONS_PER_USER`, `SSE_MAX_STREAMS_PER_USER` | `10`, `5` | 4.9 |
 | `OUTBOX_RELAY_ENABLED` | `false` | `true` только в процессе `relay` |
+| `SHUTDOWN_DRAIN_SECONDS` | `0` | сколько после SIGTERM `/health/serving` и `/health/ready` отвечают 503, а запросы ещё принимаются; на стенде и в проде `5` (больше периода активной проверки Caddy) |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `20` | сколько после слива uvicorn ждёт текущие запросы (меньше `stop_grace_period`) |
+| `SPIKE_ENDPOINTS_ENABLED` | `false` | тестовые ручки SSE и WebSocket `/api/v1/_spike/*` для спайка через Caddy (S4); в `prod` запрещены, убираются в S10 |
+
+Переменные контейнера Caddy (Caddyfile один на стенд и сервер): `SITE_ADDRESS` (домен; стенд `messunjerr.localhost`), `TLS_MODE` (`tls_internal` для стенда, `tls_auto` для сервера), `HSTS_MAX_AGE` (по умолчанию год, на стенде 300 с), `ACME_EMAIL` (для Let's Encrypt).
 
 ### 6.2. Эскизы Caddyfile и Compose
 
 Эскиз: структура верна, точные имена параметров сверяются с документацией образов на этапе 0.
+
+⚠️ **Рабочие файлы `deploy/Caddyfile` и `deploy/compose.yml` проверены на стенде S4 и верны при расхождении с эскизами ниже.** Расхождения. Caddyfile: служебные адреса закрывает первый `handle @internal` (верхнеуровневый `respond` после `handle` не срабатывает: общий `handle` со статикой отвечает раньше); заголовки с одним полем и разными матчерами Caddy упорядочивает по специфичности, а не по порядку в файле (поэтому два CSP, обычный и для Swagger UI, разведены матчерами); `request_header` с `?` не работает, нужен матчер `header !X-Request-ID`; повтор на соседней реплике `lb_try_duration` и проверка `/health/serving` раз в 2 с (она не зависит от PostgreSQL и Redis); размеры в `request_body` в МиБ (`MB` у Caddy это 10^6 байт, а пределы приложения двоичные), внешний предел API 2 МиБ только страхует: точный предел 1 МиБ с ответом `problem+json` держит приложение; под `/media/public/*` разрешены только GET и HEAD, служебные заголовки хранилища убраны, журнал скрывает и параметры подписи `X-Amz-*`; домен и TLS задаются переменными (6.1). Compose: три сети, секреты файлами, `cpuset` и `memswap_limit`, задачи `db-init`, `migrate`, `s3-certs`, sidecar `pgbackrest`, SeaweedFS в собственном образе (`socat`): всё, кроме S3 (8333 и HTTPS 8334 для pgBackRest), слушает только `127.0.0.1`, buckets создаёт сам контейнер, без `-volume.max` и с `-master.telemetry=false`; `init: true` у `postgres` (иначе сирота асинхронной архивации pgBackRest при недоступном хранилище заставляет PostgreSQL перезапустить все серверные процессы).
 
 Локальный prod-подобный стенд (S4) использует тот же Caddyfile с двумя отличиями: домен `messunjerr.localhost` (браузеры сами направляют `*.localhost` на 127.0.0.1) и директива `tls internal` вместо выпуска сертификатов Let's Encrypt. Сертификаты выпускает внутренний центр Caddy, его корневой сертификат один раз доверяют в ОС и браузерах. Лимиты памяти и ядер контейнеров задаются как у VPS (2.3).
 
@@ -3211,19 +3235,23 @@ example.ru {
 		}
 	}
 
-	# служебные адреса снаружи недоступны
-	@internal path /health/* /metrics
-	respond @internal 404
+	# служебные адреса снаружи недоступны (первым handle: общий handle ниже отдал бы им страницу SPA)
+	@internal path /health /health/* /metrics /metrics/*
+	handle @internal {
+		respond 404
+	}
 
 	handle /api/* {
 		request_body {
-			max_size 1MB
+			max_size 2MiB
 		}
 		reverse_proxy api-a:8000 api-b:8000 {
 			lb_policy least_conn
-			health_uri /health/ready
-			health_interval 5s
-			health_timeout 2s
+			lb_try_duration 5s
+			lb_try_interval 250ms
+			health_uri /health/serving
+			health_interval 2s
+			health_timeout 1s
 			flush_interval -1
 		}
 	}
@@ -3966,7 +3994,7 @@ SELECT p.*
 
 | Метод и путь | Доступ | Лимит |
 |---|---|---|
-| `POST /media/uploads` | токен | `upload_init` |
+| `POST /media/uploads` | токен | `upload_init`, `api_write` |
 | `POST /media/uploads/{asset_id}/complete` | владелец | W |
 | `GET /media/{asset_id}`, `GET /media/quota` | владелец | R |
 | `GET /media/{asset_id}/urls` | владелец или тот, кому ресурс виден | R |
@@ -4025,4 +4053,4 @@ SELECT p.*
 |---|---|
 | `GET /meta` | публично |
 | `GET /openapi.json`, `GET /docs` | только dev и stage |
-| `GET /health/live`, `GET /health/ready`, `GET /metrics` (вне `/api/v1`) | внутренний |
+| `GET /health/live`, `GET /health/serving`, `GET /health/ready`, `GET /metrics` (вне `/api/v1`) | внутренний |

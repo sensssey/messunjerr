@@ -17,6 +17,13 @@ from messunjerr.settings import get_settings
 
 
 def _serve(args: argparse.Namespace) -> int:
+    if args.workers == 1 and not args.reload:
+        # Боевой путь: один процесс, мягкая остановка со сливом трафика (S4-03).
+        from messunjerr.core.server import run_server
+
+        run_server(get_settings(), host=args.host, port=args.port)
+        return 0
+
     import uvicorn  # тяжёлый импорт нужен только этой команде
 
     uvicorn.run(
@@ -45,8 +52,13 @@ def _db_init(_: argparse.Namespace) -> int:
 def _migrate(_: argparse.Namespace) -> int:
     from alembic import command
 
-    from messunjerr.core.migrations import alembic_config
+    from messunjerr.core.migrations import alembic_config, database_is_ahead
 
+    url = get_settings().migrator_database_url
+    if url is not None and asyncio.run(database_is_ahead(url.get_secret_value())):
+        # Откат кода после выкладки с миграцией: схема совместима с обеими версиями (4.16), менять нечего.
+        print("migrate: БД новее кода (её ревизии нет в этой сборке): миграции не применяются")
+        return 0
     command.upgrade(alembic_config(), "head")
     print("migrate: схема на последней ревизии")
     return 0

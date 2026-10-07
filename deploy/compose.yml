@@ -1,0 +1,546 @@
+# Prod-подобный стенд (S4): набор сервисов, сети, секреты и лимиты как на VPS 8 ГБ / 4 vCPU, но на
+# ноутбуке: домен `messunjerr.localhost`, сертификат от внутреннего центра Caddy, письма в Mailpit.
+# В Compose боевого сервера (S21) меняются адрес, TLS и SMTP; остальное то же самое.
+#
+#   py -3 scripts/init_prod_like.py                                           # секреты в deploy/secrets (один раз)
+#   docker compose -p messunjerr-stand -f deploy/compose.yml up -d --build --wait   # или `make up-prod-like`, `./dev.ps1 up-prod-like`
+#   https://messunjerr.localhost/api/v1/meta
+#
+# Проект и тома отдельные от среды разработки (compose.dev.yml): оба стенда можно держать одновременно.
+# Всегда указывайте `-p messunjerr-stand`: имя проекта из окружения или из старого deploy/.env
+# (COMPOSE_PROJECT_NAME) перебивает `name:`. От общих томов с dev-стеком защищают явные имена томов ниже.
+name: messunjerr-stand
+
+# --------------------------------------------------------------------------- общие блоки
+x-common: &common
+  restart: unless-stopped
+  # Как у VPS: все контейнеры делят 4 ядра (cpuset), память ограничена по таблице 4.16 (воркеры тремя
+  # процессами по 256 МБ вместо одного worker на 512 МБ), своп выключен (memswap_limit равен mem_limit),
+  # чтобы нехватка памяти проявлялась так же, как на сервере. Docker с меньшим числом ядер не запустит
+  # контейнеры с cpuset 0-3: задайте STAND_CPUSET (например, 0-1), но лимиты тогда перестанут быть как у VPS.
+  cpuset: "${STAND_CPUSET:-0-3}"
+  # Ни один процесс контейнера не получает больше привилегий, чем у запустившего (setuid и подобное).
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+# Окружение одноразовых задач и основа окружения сервисов. Приложение читает КАЖДУЮ переменную
+# <ИМЯ>_FILE, поэтому в окружении сервиса не должно быть файлов, которых к нему не смонтировали.
+x-job-env: &job-env
+  # `stage`: все проверки prod (обязательные секреты, JSON-логи), но документация OpenAPI включена.
+  APP_ENV: stage
+  APP_BUILD: ${TAG:-local}
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  PUBLIC_BASE_URL: https://messunjerr.localhost
+  # Секреты читаются из файлов (Settings: <ИМЯ>_FILE), в окружение и `docker inspect` не попадают.
+  DATABASE_URL_FILE: /run/secrets/database_url
+  REDIS_URL_FILE: /run/secrets/redis_url
+
+x-backend-env: &backend-env
+  <<: *job-env
+  MAIL_FROM: messunjerr <no-reply@messunjerr.localhost>
+  JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_private_key
+  SMTP_URL_FILE: /run/secrets/smtp_url
+  # Перед Caddy стоит только он сам и сеть internal закрыта снаружи: заголовкам X-Forwarded-* верим.
+  FORWARDED_ALLOW_IPS: "*"
+  SHUTDOWN_DRAIN_SECONDS: "5"
+  SHUTDOWN_TIMEOUT_SECONDS: "20"
+  # 🔬 Тестовые ручки SSE и WebSocket для спайка S4; убираются в S10.
+  SPIKE_ENDPOINTS_ENABLED: "true"
+
+# Хранилище файлов (S5): только у тех, кто с ним работает (API, воркеры media и default); остальным
+# ключи не монтируются. Внутренний адрес для HEAD, чтения и удаления; ссылки на загрузку подписываются
+# публичным адресом (S3_ENDPOINT_PUBLIC по умолчанию PUBLIC_BASE_URL): Caddy ведёт /media/* в SeaweedFS
+# без переписывания пути, а подпись SigV4 включает Host.
+x-s3-env: &s3-env
+  S3_ENDPOINT_INTERNAL: http://seaweedfs:8333
+  S3_BUCKET: media
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_app_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_app_secret_key
+
+x-backend: &backend
+  <<: *common
+  image: messunjerr-v2-prod:${TAG:-local}
+  build:
+    context: ../backend
+    dockerfile: Dockerfile.v2
+    target: prod
+    args:
+      APP_BUILD: ${TAG:-local}
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  # SHUTDOWN_DRAIN_SECONDS (5) + SHUTDOWN_TIMEOUT_SECONDS (20) укладываются в 30 с.
+  stop_grace_period: 30s
+  environment: *backend-env
+  secrets: [database_url, redis_url, jwt_private_key, smtp_url]
+  networks: [internal, egress]
+
+x-api: &api
+  <<: *backend
+  environment:
+    <<: [*backend-env, *s3-env]
+  secrets: [database_url, redis_url, jwt_private_key, smtp_url, s3_app_access_key, s3_app_secret_key]
+  command: ["python", "-m", "messunjerr", "serve", "--host", "0.0.0.0"]
+  mem_limit: 512m
+  memswap_limit: 512m
+  healthcheck:
+    test: ["CMD", "python", "-m", "messunjerr", "healthcheck"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+# --------------------------------------------------------------------------- сервисы
+services:
+  caddy:
+    <<: *common
+    image: caddy:2.11-alpine
+    ports:
+      # Только loopback: стенд не должен быть виден из локальной сети.
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+      - "127.0.0.1:443:443/udp"
+    environment:
+      SITE_ADDRESS: messunjerr.localhost
+      TLS_MODE: tls_internal
+      HSTS_MAX_AGE: "300"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend-placeholder:/srv/frontend:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    memswap_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      edge:
+        # Тесты стенда подключаются к сети edge и ходят на тот же адрес, что и браузер.
+        aliases: [messunjerr.localhost]
+      internal: {}
+
+  api-a:
+    <<: *api
+  api-b:
+    <<: *api
+
+  # Очереди email (письма), default (плановые задачи) и media (файлы): по одному процессу на очередь.
+  worker:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "worker", "--queue", "email"]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "worker", "--queue", "email", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+
+  worker-default:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "worker", "--queue", "default"]
+    # Плановые задачи ходят в БД, Redis и хранилище (суточная сверка объектов), наружу им незачем.
+    environment:
+      <<: [*backend-env, *s3-env]
+    secrets: [database_url, redis_url, jwt_private_key, smtp_url, s3_app_access_key, s3_app_secret_key]
+    networks: [internal]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "worker", "--queue", "default", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Очередь media (S5): проверка загруженных файлов и удаление объектов из хранилища. S6 даст ему Pillow
+  # (перекодирование изображений до 25 мегапикселей) и, скорее всего, больше памяти.
+  worker-media:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "worker", "--queue", "media"]
+    environment:
+      <<: [*backend-env, *s3-env]
+    secrets: [database_url, redis_url, jwt_private_key, smtp_url, s3_app_access_key, s3_app_secret_key]
+    networks: [internal]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-m", "messunjerr", "worker", "--queue", "media", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+
+  # Одноразовая задача: роли и база (нужен суперпользователь). Идемпотентна. Выкладка её не запускает.
+  db-init:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "db-init"]
+    restart: "no"
+    mem_limit: 256m
+    environment:
+      <<: *job-env
+      ADMIN_DATABASE_URL_FILE: /run/secrets/admin_database_url
+      MIGRATOR_DATABASE_URL_FILE: /run/secrets/migrator_database_url
+      DB_READONLY_PASSWORD_FILE: /run/secrets/db_readonly_password
+    secrets:
+      [database_url, redis_url, admin_database_url, migrator_database_url, db_readonly_password]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  # Одноразовая задача: миграции до head под ролью migrator. Выкладка запускает её отдельным шагом
+  # до перезапуска реплик (deploy/rollout.sh), поэтому миграции должны быть совместимы со старым кодом.
+  migrate:
+    <<: *backend
+    command: ["python", "-m", "messunjerr", "migrate"]
+    restart: "no"
+    mem_limit: 256m
+    environment:
+      <<: *job-env
+      MIGRATOR_DATABASE_URL_FILE: /run/secrets/migrator_database_url
+    secrets: [database_url, redis_url, migrator_database_url]
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  postgres:
+    <<: *common
+    image: messunjerr-postgres:18
+    build:
+      context: ./postgres
+    # PID 1 обязан быть init: асинхронный archive-push (archive-async=y) оставляет сирот, а если PID 1
+    # сам postmaster, он принимает сироту за «чужой дочерний процесс» и при его ненулевом коде выхода
+    # (хранилище недоступно) перезапускает все серверные процессы: «untracked child process exited
+    # with exit code 103», цикл восстановления и обрыв соединений.
+    init: true
+    entrypoint: ["/bin/sh", "/usr/local/bin/mj-entrypoint.sh"]
+    # Настройки из 4.16; io_uring в контейнере требует ослабить seccomp, поэтому io_method=worker.
+    # archive_timeout=60: при записи WAL уходит в хранилище не реже раза в минуту (RPO ≤ 5 минут).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=100
+      - -c
+      - io_method=worker
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=messunjerr archive-push %p
+      - -c
+      - archive_timeout=60
+      - -c
+      - idle_in_transaction_session_timeout=30s
+      - -c
+      - lock_timeout=5s
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_min_duration_statement=250ms
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password, s3_backup_access_key, s3_backup_secret_key, pgbackrest_cipher_pass]
+    volumes:
+      # PostgreSQL 18: том монтируется в /var/lib/postgresql, а не в .../data.
+      - pgdata:/var/lib/postgresql
+      - pgsocket:/var/run/postgresql
+      - ./postgres/entrypoint.sh:/usr/local/bin/mj-entrypoint.sh:ro
+      - ./backup:/backup:ro
+      - s3ca:/etc/seaweedfs-tls:ro
+    shm_size: 256m
+    mem_limit: 2g
+    memswap_limit: 2g
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    depends_on:
+      s3-certs:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  # Копии: stanza, первая полная копия и расписание (deploy/backup/run.sh). Рядом с postgres, общий
+  # каталог данных (только чтение) и сокет; собственный лимит памяти, чтобы копия не съедала память БД.
+  pgbackrest:
+    <<: *common
+    image: messunjerr-postgres:18
+    user: postgres
+    init: true
+    entrypoint: ["/bin/sh", "/backup/run.sh"]
+    environment:
+      BACKUP_AT: "03:00"
+      BACKUP_FULL_DOW: "7"
+    secrets: [s3_backup_access_key, s3_backup_secret_key, pgbackrest_cipher_pass]
+    volumes:
+      - pgdata:/var/lib/postgresql:ro
+      - pgsocket:/var/run/postgresql
+      - ./backup:/backup:ro
+      - s3ca:/etc/seaweedfs-tls:ro
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/backup/status.sh", "--quiet"]
+      interval: 5m
+      timeout: 30s
+      retries: 1
+      start_period: 15m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    networks: [internal]
+
+  redis:
+    <<: *common
+    image: redis:8
+    # maxmemory ниже лимита контейнера: перезапись AOF и копии при fork нужна память сверх данных.
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb
+        --maxmemory-policy noeviction --requirepass "$$(cat /run/secrets/redis_password)"
+    secrets: [redis_password]
+    volumes:
+      - redisdata:/data
+    mem_limit: 384m
+    memswap_limit: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$(cat /run/secrets/redis_password)\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [internal]
+
+  # Файлы приложения (bucket media) и копии БД (bucket pgbackrest). Снаружи доступен только через
+  # Caddy: /media/* без переписывания пути (S4-05). HTTPS-порт 8334 нужен pgBackRest.
+  # Всё, что у SeaweedFS без проверки прав (master, volume, filer, gRPC, Iceberg, Lance), слушает
+  # только 127.0.0.1; наружу контейнера entrypoint.sh пробрасывает лишь S3 (8333 и 8334). Buckets
+  # создаёт он же, поэтому отдельной задачи инициализации нет (причина: seaweedfs/Dockerfile).
+  seaweedfs:
+    <<: *common
+    image: messunjerr-seaweedfs:4.47
+    build:
+      context: ./seaweedfs
+    init: true
+    entrypoint: ["/bin/sh", "/seaweedfs-entrypoint.sh"]
+    command:
+      - server
+      - -dir=/data
+      - -filer
+      - -s3
+      - -ip=127.0.0.1
+      - -ip.bind=127.0.0.1
+      - -s3.ip.bind=127.0.0.1
+      - -s3.port=9000
+      - -s3.port.https=9001
+      - -s3.cert.file=/tls/server.crt
+      - -s3.key.file=/tls/server.key
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+      - -s3.allowedOrigins=https://messunjerr.localhost
+      # Анонимную статистику наружу не отправляем (⚖️ исходящий трафик ограничен).
+      - -master.telemetry=false
+    environment:
+      S3_APP_ACCESS_KEY_FILE: /run/secrets/s3_app_access_key
+      S3_APP_SECRET_KEY_FILE: /run/secrets/s3_app_secret_key
+      S3_BACKUP_ACCESS_KEY_FILE: /run/secrets/s3_backup_access_key
+      S3_BACKUP_SECRET_KEY_FILE: /run/secrets/s3_backup_secret_key
+      S3_BUCKETS: media pgbackrest
+      S3_FORWARD_HTTPS: "1"
+    secrets: [s3_app_access_key, s3_app_secret_key, s3_backup_access_key, s3_backup_secret_key]
+    volumes:
+      - ./seaweedfs/entrypoint.sh:/seaweedfs-entrypoint.sh:ro
+      - ./seaweedfs/buckets.sh:/seaweedfs-buckets.sh:ro
+      - seaweed:/data
+      - s3tls:/tls:ro
+    mem_limit: 768m
+    memswap_limit: 768m
+    healthcheck:
+      # Проверяет и проброс (8333), и master, и то, что buckets созданы.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null http://127.0.0.1:8333/healthz
+          && wget -q -O /dev/null http://127.0.0.1:9333/cluster/status
+          && /bin/sh /seaweedfs-buckets.sh --check
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      s3-certs:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  # Одноразовая задача: самоподписанный сертификат для HTTPS-порта SeaweedFS. Ключ с сертификатом
+  # в томе s3tls (только для SeaweedFS), копия одного сертификата в томе s3ca (для клиентов).
+  s3-certs:
+    image: messunjerr-postgres:18
+    entrypoint: ["/bin/sh", "/gen-cert.sh"]
+    restart: "no"
+    volumes:
+      - ./seaweedfs/gen-cert.sh:/gen-cert.sh:ro
+      - s3tls:/tls
+      - s3ca:/ca
+    mem_limit: 64m
+    networks: [internal]
+
+  # Письма стенда: Mailpit вместо почтового провайдера (его подключает S21). Веб-интерфейс на loopback.
+  mailpit:
+    <<: *common
+    image: axllent/mailpit:v1.31.4
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "127.0.0.1:${STAND_MAILPIT_PORT:-8026}:8025"
+    mem_limit: 64m
+    memswap_limit: 64m
+    # Порты наружу Docker публикует только у контейнеров хотя бы в одной обычной сети, а internal
+    # без выхода наружу: UI Mailpit поэтому стоит ещё и в edge (SMTP остаётся внутренним).
+    networks: [internal, edge]
+
+  # Учение по восстановлению: `./dev.ps1 restore-drill` (deploy/restore-drill.sh). По умолчанию не запускается.
+  restore-drill:
+    image: messunjerr-postgres:18
+    profiles: ["drill"]
+    user: postgres
+    entrypoint: ["/bin/sh", "/backup/restore-drill.sh"]
+    environment:
+      DB_NAME: messunjerr
+      DRILL_MARKER: ${DRILL_MARKER:-}
+      EXPECT_ALEMBIC: ${EXPECT_ALEMBIC:-}
+      EXPECT_COUNTS: ${EXPECT_COUNTS:-}
+    secrets: [s3_backup_access_key, s3_backup_secret_key, pgbackrest_cipher_pass]
+    volumes:
+      - pgrestore:/var/lib/postgresql
+      - ./backup:/backup:ro
+      - s3ca:/etc/seaweedfs-tls:ro
+    mem_limit: 1g
+    networks: [internal]
+
+  # Тесты стенда: `./dev.ps1 stand-test`. Контейнер в сети edge ходит на тот же адрес, что и браузер,
+  # и доверяет корневому сертификату Caddy из тома caddy_data.
+  stand-tools:
+    image: messunjerr-v2-dev
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.v2
+      target: dev
+    profiles: ["tools"]
+    working_dir: /app
+    command: ["pytest", "-c", "pyproject.toml", "tests_v2/stand"]
+    environment:
+      STAND_BASE_URL: https://messunjerr.localhost
+      STAND_CA_FILE: /caddy-data/caddy/pki/authorities/local/root.crt
+      STAND_ACCESS_LOG: /var/log/caddy/access.log
+      STAND_S3_ACCESS_KEY_FILE: /run/secrets/s3_app_access_key
+      STAND_S3_SECRET_KEY_FILE: /run/secrets/s3_app_secret_key
+      # Воркер кладёт аватары в public/ по внутреннему адресу, мимо Caddy: тесты делают то же самое.
+      STAND_INTERNAL_S3_URL: http://seaweedfs:8333
+      # Тесты загрузки (S5) заводят аккаунт через API и читают письмо подтверждения из Mailpit.
+      STAND_MAILPIT_URL: http://mailpit:8025
+    secrets: [s3_app_access_key, s3_app_secret_key]
+    volumes:
+      - ../backend/src/messunjerr:/app/src/messunjerr:ro
+      - ../backend/tests_v2:/app/tests_v2:ro
+      - ../backend/pyproject.toml:/app/pyproject.toml:ro
+      - ../backend/alembic.ini:/app/alembic.ini:ro
+      - ../backend/migrations:/app/migrations:ro
+      - caddy_data:/caddy-data:ro
+      - caddy_logs:/var/log/caddy:ro
+    networks: [edge, internal]
+
+# --------------------------------------------------------------------------- сети, тома, секреты
+networks:
+  edge: {}
+  # Без выхода наружу: postgres, redis, seaweedfs и все остальные (api и оба воркера подключены ещё к egress).
+  internal:
+    internal: true
+  egress: {}
+
+# Имена томов заданы явно: при чужом имени проекта (старый COMPOSE_PROJECT_NAME) стенд всё равно не
+# сядет на тома dev-стека (messunjerr-v2_*), а `down -v` не сотрёт базу разработки.
+volumes:
+  pgdata: { name: messunjerr-stand_pgdata }
+  pgsocket: { name: messunjerr-stand_pgsocket }
+  pgrestore: { name: messunjerr-stand_pgrestore }
+  redisdata: { name: messunjerr-stand_redisdata }
+  seaweed: { name: messunjerr-stand_seaweed }
+  s3tls: { name: messunjerr-stand_s3tls }
+  s3ca: { name: messunjerr-stand_s3ca }
+  caddy_data: { name: messunjerr-stand_caddy_data }
+  caddy_config: { name: messunjerr-stand_caddy_config }
+  caddy_logs: { name: messunjerr-stand_caddy_logs }
+
+# Файлы создаёт scripts/init_prod_like.py (в git не попадают).
+secrets:
+  postgres_password: { file: ./secrets/postgres_password }
+  admin_database_url: { file: ./secrets/admin_database_url }
+  migrator_database_url: { file: ./secrets/migrator_database_url }
+  database_url: { file: ./secrets/database_url }
+  db_readonly_password: { file: ./secrets/db_readonly_password }
+  redis_password: { file: ./secrets/redis_password }
+  redis_url: { file: ./secrets/redis_url }
+  jwt_private_key: { file: ./secrets/jwt_private_key }
+  smtp_url: { file: ./secrets/smtp_url }
+  s3_app_access_key: { file: ./secrets/s3_app_access_key }
+  s3_app_secret_key: { file: ./secrets/s3_app_secret_key }
+  s3_backup_access_key: { file: ./secrets/s3_backup_access_key }
+  s3_backup_secret_key: { file: ./secrets/s3_backup_secret_key }
+  pgbackrest_cipher_pass: { file: ./secrets/pgbackrest_cipher_pass }

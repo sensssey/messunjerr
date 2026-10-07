@@ -12,6 +12,7 @@ from messunjerr.identity.api.deps import (
     SensitivePrincipalDep,
     limit_user,
     no_store,
+    principal_user_id,
 )
 from messunjerr.identity.commands.common import ClientInfo
 from messunjerr.identity.infra.ports import MeExtrasProvider, ProfileProvisioner, ProfileSeed
@@ -31,4 +32,5 @@ __all__ = [
     "find_account",
     "limit_user",
     "no_store",
+    "principal_user_id",
 ]

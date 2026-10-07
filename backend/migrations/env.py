@@ -18,6 +18,7 @@ for module in (
     "messunjerr.core.models",
     "messunjerr.identity.infra.models",
     "messunjerr.profiles.infra.models",
+    "messunjerr.media.infra.models",
 ):
     import_module(module)
 

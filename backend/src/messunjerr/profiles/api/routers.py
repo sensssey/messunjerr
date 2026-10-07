@@ -36,7 +36,7 @@ _AUTH_ERRORS = {**TOKEN_ERRORS, **problem_responses(ErrorCode.ACCOUNT_DELETION_P
     summary="Изменить профиль",
     description=(
         "Как JSON Merge Patch: отсутствующий ключ без изменений, `null` очищает поле (если можно). "
-        "`avatar_asset_id` пока всегда `asset_not_found`: загрузки файлов появятся в S5–S6. "
+        "`avatar_asset_id` пока всегда `asset_not_found`: загрузка файлов есть (S5), привязку аватара добавит S6. "
         "Лимит `api_write`."
     ),
     dependencies=[Depends(limit_user("api_write"))],

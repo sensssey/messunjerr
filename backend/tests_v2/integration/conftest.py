@@ -37,7 +37,9 @@ from messunjerr.core.db import SCHEMAS, create_engine, create_sessionmaker
 from messunjerr.core.dbinit import init_database, plan_from_settings
 from messunjerr.core.jobs import InMemoryJobQueue
 from messunjerr.core.redis import create_redis
+from messunjerr.core.shutdown import ShutdownGate
 from messunjerr.main import create_app
+from messunjerr.media.infra.memory import InMemoryObjectStorage
 from messunjerr.settings import Settings
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -156,6 +158,11 @@ def test_settings(base_settings: Settings, database: DatabaseUnderTest) -> Setti
         # Адрес SMTP (Mailpit) нужен только сквозному тесту писем; без него тест пропускается.
         smtp_url=base_settings.smtp_url,
         mail_from="messunjerr <no-reply@messunjerr.local>",
+        # Хранилище в тестах подставное; настоящий S3 из окружения контейнера берёт только test_media_s3.py.
+        s3_endpoint_internal=None,
+        s3_endpoint_public=None,
+        s3_access_key=None,
+        s3_secret_key=None,
         # Лимиты выключены: тесты делают много регистраций и входов с одного адреса. Тесты самих
         # лимитов собирают приложение с `rate_limits_enabled=True` и малыми значениями.
         rate_limits_enabled=False,
@@ -233,9 +240,36 @@ def jobs() -> InMemoryJobQueue:
     return InMemoryJobQueue()
 
 
+@pytest.fixture
+def storage() -> InMemoryObjectStorage:
+    """Хранилище файлов в памяти: «загрузку клиентом по presigned-ссылке» тест делает методом `put`."""
+    return InMemoryObjectStorage()
+
+
 @pytest_asyncio.fixture
-async def app(test_settings: Settings, jobs: InMemoryJobQueue) -> AsyncIterator[FastAPI]:
-    application = create_app(test_settings, job_queue=jobs)
+async def single_connection_sessions(
+    test_settings: Settings,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Сессии с пулом из одного соединения: видно, держит ли код соединение, пока ждёт сеть."""
+    engine = create_engine(
+        test_settings.model_copy(
+            update={"db_pool_size": 1, "db_max_overflow": 0, "db_pool_timeout_seconds": 2.0}
+        )
+    )
+    try:
+        yield create_sessionmaker(engine)
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def app(
+    test_settings: Settings, jobs: InMemoryJobQueue, storage: InMemoryObjectStorage
+) -> AsyncIterator[FastAPI]:
+    # Своя калитка слива на каждое приложение: тест, который закрывает её, не влияет на соседей.
+    application = create_app(
+        test_settings, job_queue=jobs, shutdown_gate=ShutdownGate(), storage=storage
+    )
     async with LifespanManager(application):
         yield application
 

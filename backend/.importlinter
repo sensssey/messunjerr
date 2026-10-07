@@ -43,6 +43,18 @@ layers =
     infra
     domain
 
+[importlinter:contract:media-layers]
+name = Внутри media: api, commands, queries, infra, domain
+type = layers
+containers =
+    messunjerr.media
+layers =
+    api
+    commands
+    queries
+    infra
+    domain
+
 # Контексты выше identity берут у него только публичный интерфейс (4.2, правило 1): зависимости
 # аутентификации, карточку аккаунта и порты. Модели, репозитории и команды identity им не видны.
 # Косвенные импорты разрешены: сам `api_public` стоит поверх внутренностей identity.
@@ -87,6 +99,7 @@ forbidden_modules =
     messunjerr.cli
     messunjerr.seeding
     messunjerr.system
+    messunjerr.spike
     messunjerr.jobs
     messunjerr.consumers
     messunjerr.relay

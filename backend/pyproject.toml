@@ -26,6 +26,8 @@ dependencies = [
     "jinja2>=3.1,<4",
     # S3: проверка часовых поясов IANA не должна зависеть от системных файлов образа
     "tzdata>=2025.2",
+    # S5: файлы лежат в S3-хранилище (SeaweedFS, S3 провайдера): presigned URL, HEAD, чтение, удаление
+    "aiobotocore>=3.9,<4",
 ]
 
 [project.scripts]
@@ -43,6 +45,8 @@ dev = [
     "pyright>=1.1.390",
     "import-linter>=2.1",
     "pre-commit>=4.0",
+    # S5: типы клиента S3 для pyright strict (в рантайме не нужны)
+    "types-aiobotocore-s3>=3.9,<4",
 ]
 
 [tool.uv]
@@ -70,6 +74,7 @@ asyncio_default_test_loop_scope = "session"
 addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
 markers = [
     "integration: нужны PostgreSQL и Redis (см. tests_v2/integration/conftest.py)",
+    "offline: тест из tests_v2/stand, которому сам стенд не нужен (без STAND_BASE_URL не пропускается)",
 ]
 filterwarnings = [
     "error",
@@ -113,6 +118,7 @@ ignore = [
 "migrations/**" = ["S608", "N999"]
 "src/messunjerr/core/dbinit.py" = ["S608"]
 "src/messunjerr/cli.py" = ["T201"]  # командная строка печатает результат в stdout
+"tests_v2/stand/probe.py" = ["T201"]  # программа, а не тест: итог нагрузки идёт в stdout
 
 [tool.ruff.lint.isort]
 known-first-party = ["messunjerr"]

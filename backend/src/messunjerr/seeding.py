@@ -24,8 +24,13 @@ from messunjerr.core.db import create_engine
 from messunjerr.core.ids import uuid7
 from messunjerr.identity.infra.models import UserRow
 from messunjerr.identity.infra.password_service import PasswordService
+from messunjerr.media.infra import models as media_models
 from messunjerr.profiles.infra.models import PrivacySettingsRow, ProfileRow
 from messunjerr.settings import Settings
+
+# Таблицы media регистрируются при импорте модуля: внешний ключ аватара ссылается на media.assets,
+# и без неё SQLAlchemy не соберёт порядок вставки профилей.
+REGISTERED_MODELS = (media_models.AssetRow,)
 
 SEED_PASSWORD = "seed-password-2026"  # noqa: S105 (общий пароль учебных аккаунтов, не секрет)
 SEED_DOMAIN = "example.com"

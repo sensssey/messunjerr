@@ -20,13 +20,20 @@ from messunjerr.core.openapi import install_openapi
 from messunjerr.core.problems import install_problem_handlers
 from messunjerr.core.ratelimit import BucketConfig, RateLimiter, load_buckets
 from messunjerr.core.redis import create_redis
+from messunjerr.core.shutdown import ShutdownGate, get_shutdown_gate
 from messunjerr.identity.api.routers import api_router as identity_api_router
 from messunjerr.identity.api.routers import well_known_router
 from messunjerr.identity.services import create_identity_services
 from messunjerr.jobs.queue import ArqJobQueue
+from messunjerr.media.api.routers import api_router as media_api_router
+from messunjerr.media.domain.ports import ObjectStorage
+from messunjerr.media.infra.usage import CompositeAssetUsage
+from messunjerr.media.services import create_media_services
 from messunjerr.profiles.api.routers import api_router as profiles_api_router
+from messunjerr.profiles.infra.usage import ProfileAvatarUsage
 from messunjerr.profiles.services import create_profile_services
 from messunjerr.settings import Settings, check_runtime, get_settings
+from messunjerr.spike import spike_router
 from messunjerr.system import api_router, health_router
 
 # Пути, где вместо JSON допустима форма (например, отписка по RFC 8058, S10).
@@ -41,7 +48,9 @@ DESCRIPTION = """Бэкенд messunjerr v2: соцсеть с чатом.
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings: Settings = app.state.settings
+    gate: ShutdownGate = app.state.shutdown
     log = get_logger("messunjerr.lifespan")
+    gate.attach()
     # База часовых поясов читается один раз при старте, а не на первом запросе с `timezone`.
     await asyncio.to_thread(warm_up_timezones)
     engine = create_engine(settings)
@@ -57,8 +66,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     identity = await create_identity_services(
         settings, redis, me_extras=profiles, provisioner=profiles
     )
+    # Хранилище файлов: S3 по настройкам либо подставное из тестов; к чему привязан ресурс, знают
+    # контексты, и каждый приносит свою часть (аватар профиля, позже вложения постов и сообщений).
+    media = create_media_services(
+        settings,
+        storage=app.state.storage,
+        usage=CompositeAssetUsage([ProfileAvatarUsage()]),
+    )
+    await media.storage.warm_up()
     app.state.identity = identity
     app.state.profiles = profiles
+    app.state.media = media
     app.state.resources = AppResources(
         settings=settings,
         engine=engine,
@@ -67,12 +85,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         jobs=jobs,
         limiter=RateLimiter(redis, app.state.rate_limits, enabled=settings.rate_limits_enabled),
         expected_head=expected_head(),
+        shutdown=gate,
     )
     log.info("startup", env=settings.app_env, version=__version__, build=settings.app_build)
     try:
         yield
     finally:
+        gate.detach()
         identity.close()
+        await media.close()
         if arq_queue is not None:
             await arq_queue.close()
         await redis.aclose()
@@ -85,10 +106,16 @@ def create_app(
     *,
     job_queue: JobQueue | None = None,
     rate_limits: Mapping[str, BucketConfig] | None = None,
+    shutdown_gate: ShutdownGate | None = None,
+    storage: ObjectStorage | None = None,
 ) -> FastAPI:
-    """Собирает приложение. `job_queue` и `rate_limits` подставляют тесты; иначе arq и ratelimits.toml."""
+    """Собирает приложение. `job_queue`, `rate_limits`, `shutdown_gate` и `storage` подставляют тесты.
+
+    Иначе работают arq, ratelimits.toml, калитка процесса, которую закрывает `GracefulServer`, и
+    клиент S3 по настройкам `S3_*` (без них ручки загрузки отвечают 503).
+    """
     settings = settings or get_settings()
-    check_runtime(settings)
+    check_runtime(settings, needs_storage=True)
     configure_logging(settings.log_level, settings.log_format)
     # Ошибка в файле лимитов останавливает старт, а не всплывает на первом запросе.
     buckets = (
@@ -109,6 +136,8 @@ def create_app(
     app.state.settings = settings
     app.state.job_queue = job_queue
     app.state.rate_limits = buckets
+    app.state.shutdown = shutdown_gate or get_shutdown_gate()
+    app.state.storage = storage
 
     install_problem_handlers(app)
     # Порядок: последний добавленный стоит снаружи, поэтому контекст запроса оборачивает защиту.
@@ -124,5 +153,8 @@ def create_app(
     app.include_router(api_router)
     app.include_router(identity_api_router)
     app.include_router(profiles_api_router)
+    app.include_router(media_api_router)
+    if settings.spike_endpoints_enabled:
+        app.include_router(spike_router)
     install_openapi(app)
     return app

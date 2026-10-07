@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>messunjerr: ручная проверка потоков</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>SSE, WebSocket и presigned URL</h1>
+    <p>Ручная проверка стенда в браузере (S4). Тестовые ручки включены, пока на стенде
+      <code>SPIKE_ENDPOINTS_ENABLED=true</code>.</p>
+    <p>
+      <button id="sse">SSE: 10 событий</button>
+      <button id="ws">WebSocket: подключиться</button>
+      <button id="ws-send" disabled>Отправить «привет»</button>
+      <button id="ws-close" disabled>Закрыть</button>
+    </p>
+    <p>
+      <label>Presigned PUT <input id="put" size="40" placeholder="https://messunjerr.localhost/media/..."></label><br>
+      <label>Presigned GET <input id="get" size="40" placeholder="https://messunjerr.localhost/media/..."></label><br>
+      <button id="presign">Загрузить 100 КБ и скачать</button>
+    </p>
+    <pre id="log">журнал</pre>
+  </main>
+  <script src="/spike.js"></script>
+</body>
+</html>

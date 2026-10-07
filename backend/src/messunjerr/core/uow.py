@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from messunjerr.core.logs import get_logger
 from messunjerr.core.outbox import Outbox
 
-AfterCommitHook = Callable[[], Awaitable[None]]
+AfterCommitHook = Callable[[], Awaitable[object]]
 
 
 class UnitOfWork:

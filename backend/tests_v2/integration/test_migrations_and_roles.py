@@ -1,5 +1,9 @@
 """Миграция 0001, роли и права PostgreSQL: «с нуля до head», `alembic check`, откат и привилегии."""
 
+import asyncio
+import os
+import subprocess
+import sys
 import uuid
 
 import pytest
@@ -11,10 +15,10 @@ from sqlalchemy.pool import NullPool
 
 from messunjerr.core.db import SCHEMAS
 from messunjerr.core.dbinit import init_database, plan_from_settings
-from messunjerr.core.migrations import expected_head
+from messunjerr.core.migrations import database_is_ahead, expected_head
 from messunjerr.settings import Settings
 
-from .conftest import DatabaseUnderTest, create_database, drop_database, run_alembic
+from .conftest import BACKEND_DIR, DatabaseUnderTest, create_database, drop_database, run_alembic
 
 PLATFORM_TABLES = {"outbox", "inbox", "idempotency_keys", "audit_log"}
 INSUFFICIENT_PRIVILEGE = "42501"
@@ -56,7 +60,7 @@ async def test_platform_tables_exist(admin_engine: AsyncEngine) -> None:
 
 async def test_database_is_at_the_expected_head(admin_engine: AsyncEngine) -> None:
     (current,) = await scalars(admin_engine, "SELECT version_num FROM alembic_version")
-    assert current == expected_head() == "0003"
+    assert current == expected_head() == "0004"
 
 
 async def test_alembic_check_sees_no_drift_between_models_and_migrations(
@@ -263,3 +267,67 @@ def test_plan_needs_admin_and_migrator_urls() -> None:
 def test_plan_rejects_unsafe_database_names(base_settings: Settings, bad: str) -> None:
     with pytest.raises(ValueError, match="Недопустимое имя"):
         plan_from_settings(base_settings, database=bad)
+
+
+# ----------------------------------------------------------------------------- БД впереди кода (S4)
+async def test_database_is_ahead_only_when_its_revision_is_unknown(
+    base_settings: Settings,
+) -> None:
+    target = await create_database(base_settings)
+    admin = _admin(target)
+    try:
+        assert await database_is_ahead(target.migrator_url) is False  # на head
+        await execute(admin, "UPDATE alembic_version SET version_num = '9999_future'")
+        assert await database_is_ahead(target.migrator_url) is True  # проведена новым релизом
+        await execute(admin, "UPDATE alembic_version SET version_num = '0001'")
+        assert await database_is_ahead(target.migrator_url) is False  # известная: догонит upgrade
+        await execute(admin, "DROP TABLE alembic_version")
+        assert await database_is_ahead(target.migrator_url) is False  # пустая база
+    finally:
+        await admin.dispose()
+        await drop_database(base_settings, target.name)
+
+
+async def run_migrate_command(target: DatabaseUnderTest) -> subprocess.CompletedProcess[str]:
+    """`python -m messunjerr migrate` отдельным процессом, как его запускает одноразовая задача Compose."""
+    return await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-m", "messunjerr", "migrate"],
+        cwd=BACKEND_DIR,
+        env={
+            **os.environ,
+            "DATABASE_URL": target.app_url,
+            "MIGRATOR_DATABASE_URL": target.migrator_url,
+            "PYTHONIOENCODING": "utf-8",
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=180,
+        check=False,
+    )
+
+
+async def test_migrate_command_skips_a_database_that_is_ahead_of_the_code(
+    base_settings: Settings,
+) -> None:
+    # Откат кода после выкладки с миграцией: `alembic upgrade head` упал бы с «Can't locate revision»,
+    # и одноразовая задача `migrate` не давала бы поднять сервисы после `docker compose up`.
+    target = await create_database(base_settings, migrate=False)
+    admin = _admin(target)
+    try:
+        first = await run_migrate_command(target)
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert "последней ревизии" in first.stdout
+        (current,) = await scalars(admin, "SELECT version_num FROM alembic_version")
+        assert current == expected_head()
+
+        await execute(admin, "UPDATE alembic_version SET version_num = '9999_future'")
+        second = await run_migrate_command(target)
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert "БД новее кода" in second.stdout
+        (kept,) = await scalars(admin, "SELECT version_num FROM alembic_version")
+        assert kept == "9999_future"  # ничего не тронуто
+    finally:
+        await admin.dispose()
+        await drop_database(base_settings, target.name)

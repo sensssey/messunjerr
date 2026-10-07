@@ -10,6 +10,7 @@ arq 0.28 не умеет слушать несколько очередей в �
 идентификатор задачи arq включает время запуска.
 """
 
+import asyncio
 from datetime import UTC
 from typing import Any
 
@@ -21,20 +22,35 @@ from messunjerr.core.jobs import (
     QUEUE_DEFAULT,
     QUEUE_EMAIL,
     QUEUE_MEDIA,
+    TASK_CLEANUP_PENDING_UPLOADS,
     TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
     TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
+    TASK_DELETE_MEDIA_OBJECTS,
+    TASK_PROCESS_MEDIA,
+    TASK_RECONCILE_UPLOADS,
     TASK_SEND_EMAIL,
+    TASK_SWEEP_ORPHAN_OBJECTS,
 )
 from messunjerr.core.logs import configure_logging, get_logger
 from messunjerr.core.mail import SmtpMailer, parse_smtp_url
 from messunjerr.jobs.health import queue_key
-from messunjerr.jobs.queue import json_deserializer, json_serializer, redis_settings
+from messunjerr.jobs.queue import ArqJobQueue, json_deserializer, json_serializer, redis_settings
 from messunjerr.jobs.tasks import (
+    DELETE_MEDIA_OBJECTS_MAX_TRIES,
+    DELETE_MEDIA_OBJECTS_TIMEOUT_SECONDS,
+    PROCESS_MEDIA_MAX_TRIES,
+    PROCESS_MEDIA_TIMEOUT_SECONDS,
     SEND_EMAIL_MAX_TRIES,
+    cleanup_pending_uploads,
     cleanup_tokens_and_idempotency,
     cleanup_unverified_accounts,
+    delete_media_objects,
+    process_media,
+    reconcile_uploads,
     send_email,
+    sweep_orphan_objects,
 )
+from messunjerr.media.services import build_storage
 from messunjerr.settings import Settings, check_runtime, get_settings
 
 HEALTH_CHECK_INTERVAL_SECONDS = 30
@@ -54,7 +70,25 @@ def functions_for(queue: str) -> list[Function]:
             )
         ],
         QUEUE_DEFAULT: [],
-        QUEUE_MEDIA: [],
+        QUEUE_MEDIA: [
+            # Результат не сохраняется: повторная постановка той же задачи после итога должна проходить.
+            func(
+                process_media,
+                name=TASK_PROCESS_MEDIA,
+                max_tries=PROCESS_MEDIA_MAX_TRIES,
+                keep_result=0,
+                timeout=PROCESS_MEDIA_TIMEOUT_SECONDS,
+            ),
+            func(
+                delete_media_objects,
+                name=TASK_DELETE_MEDIA_OBJECTS,
+                max_tries=DELETE_MEDIA_OBJECTS_MAX_TRIES,
+                keep_result=0,
+                # Ключ «задача выполняется» живёт на 10 секунд дольше самого долгого тайм-аута воркера:
+                # после смерти воркера задачу не возьмёт никто, пока он не истечёт.
+                timeout=DELETE_MEDIA_OBJECTS_TIMEOUT_SECONDS,
+            ),
+        ],
     }
     return registry[queue]
 
@@ -79,6 +113,29 @@ def cron_jobs_for(queue: str) -> list[CronJob]:
                 minute=17,
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             ),
+            # Раз в час: загрузки, которые так и не завершили, занимают квоту и место в хранилище.
+            cron(
+                cleanup_pending_uploads,
+                name=TASK_CLEANUP_PENDING_UPLOADS,
+                minute=41,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            ),
+            # Каждые 5 минут: подбирает потерянные постановки обработки и удаления (до Kafka, S5-06).
+            cron(
+                reconcile_uploads,
+                name=TASK_RECONCILE_UPLOADS,
+                minute=set(range(0, 60, 5)),
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            ),
+            # Раз в сутки: объекты без живого ресурса (медленная загрузка дописалась после очистки,
+            # удаление аккаунта убрало строки каскадом) уходят из хранилища.
+            cron(
+                sweep_orphan_objects,
+                name=TASK_SWEEP_ORPHAN_OBJECTS,
+                hour=4,
+                minute=20,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            ),
         ],
         QUEUE_MEDIA: [],
     }
@@ -96,14 +153,28 @@ async def _on_startup(ctx: dict[str, Any]) -> None:
             raise RuntimeError("Для воркера почты нужен SMTP_URL (или SMTP_URL_FILE)")
         ctx["mailer"] = SmtpMailer(parse_smtp_url(settings.smtp_url.get_secret_value()))
     else:
-        check_runtime(settings)
+        # Хранилище нужно очереди media (обработка, удаление объектов) и плановым задачам default
+        # (суточная сверка объектов с таблицей).
+        needs_storage = queue in (QUEUE_MEDIA, QUEUE_DEFAULT)
+        check_runtime(settings, needs_storage=needs_storage)
         engine = create_engine(settings)
         ctx["engine"] = engine
         ctx["sessionmaker"] = create_sessionmaker(engine)
+        ctx["jobs"] = ArqJobQueue(settings.redis_url.get_secret_value())
+        if needs_storage:
+            storage = build_storage(settings)
+            await storage.warm_up()
+            ctx["storage"] = storage
     get_logger("messunjerr.jobs").info("worker_started", queue=queue)
 
 
 async def _on_shutdown(ctx: dict[str, Any]) -> None:
+    storage = ctx.get("storage")
+    if storage is not None:
+        await storage.close()
+    jobs = ctx.get("jobs")
+    if jobs is not None:
+        await jobs.close()
     engine = ctx.get("engine")
     if engine is not None:
         await engine.dispose()
@@ -136,8 +207,22 @@ def build_worker(
 
 
 async def run_worker(queue: str) -> None:
+    """Запускает воркер очереди и останавливает его по SIGTERM и SIGINT без ошибки.
+
+    `Worker.async_run` задумана для тестов: при сигнале arq отменяет главную задачу воркера,
+    исключение `CancelledError` уходит наружу, а `close()` (в нём `on_shutdown`: закрыть клиент S3,
+    пул БД и очередь, убрать ключ проверки здоровья) не вызывается. Без этого каждая остановка
+    контейнера заканчивалась трассировкой, кодом 1 и сообщением «Unclosed client session».
+    """
     worker = build_worker(queue, get_settings())
-    await worker.async_run()
+    try:
+        await worker.async_run()
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise  # отменили саму эту задачу, а не главную задачу воркера
+    finally:
+        await worker.close()
 
 
 __all__ = ["build_worker", "cron_jobs_for", "functions_for", "run_worker"]

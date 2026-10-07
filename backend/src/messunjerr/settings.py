@@ -91,8 +91,54 @@ class Settings(BaseSettings):
         description="сколько ждать свободное соединение, когда все заняты (потом: Redis недоступен)",
     )
 
+    # --- хранилище файлов (S5): S3 API (SeaweedFS в разработке и на стенде, S3 провайдера на сервере)
+    s3_endpoint_internal: str | None = Field(
+        default=None,
+        description="адрес S3 для HEAD, чтения и удаления из серверов (внутренняя сеть)",
+    )
+    s3_endpoint_public: str | None = Field(
+        default=None,
+        description=(
+            "база presigned URL: подпись SigV4 включает Host, поэтому ссылки подписываются тем "
+            "адресом, по которому к хранилищу придёт браузер; по умолчанию PUBLIC_BASE_URL"
+        ),
+    )
+    s3_bucket: str = "media"
+    s3_region: str = "us-east-1"
+    s3_access_key: SecretStr | None = None
+    s3_secret_key: SecretStr | None = None
+    upload_url_ttl_seconds: int = Field(
+        default=900, ge=60, le=3600, description="сколько действует presigned PUT (5.8: 15 минут)"
+    )
+    pending_upload_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description="через сколько часов незавершённая загрузка удаляется вместе с объектом (4.11)",
+    )
+
     # --- HTTP
     request_body_limit_bytes: int = Field(default=1_048_576, ge=1024)
+
+    # --- остановка (S4-03): сначала слив трафика, потом закрытие. На стенде и в проде
+    # SHUTDOWN_DRAIN_SECONDS больше периода активной проверки Caddy (health_interval + timeout).
+    shutdown_drain_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        le=60,
+        description=(
+            "сколько после SIGTERM /health/serving и /health/ready отвечают 503, "
+            "а запросы ещё принимаются"
+        ),
+    )
+    shutdown_timeout_seconds: int = Field(
+        default=20,
+        ge=1,
+        le=120,
+        description="сколько после слива uvicorn ждёт текущие запросы (меньше stop_grace_period)",
+    )
+    # 🔬 Тестовые ручки SSE и WebSocket для спайка через Caddy (S4-02); убираются в S10.
+    spike_endpoints_enabled: bool = False
 
     # --- токены и сессии (4.7): ключ Ed25519 в PEM (PKCS8) или 32 байта seed в base64url
     jwt_private_key: SecretStr | None = None
@@ -173,6 +219,15 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("s3_endpoint_internal", "s3_endpoint_public")
+    @classmethod
+    def _s3_endpoint(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("ожидается адрес вида http://хост:порт или https://хост")
+        return value.rstrip("/")
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url(cls, value: SecretStr) -> SecretStr:
@@ -202,6 +257,20 @@ class Settings(BaseSettings):
         """В prod и stage обязательные секреты и адреса проверяются при старте (`check_runtime`)."""
         return self.app_env in ("prod", "stage")
 
+    @property
+    def storage_configured(self) -> bool:
+        """Задано всё, что нужно клиенту S3: адрес, ключи; публичный адрес берётся из `base_url`."""
+        return (
+            bool(self.s3_endpoint_internal)
+            and self.s3_access_key is not None
+            and self.s3_secret_key is not None
+        )
+
+    @property
+    def storage_public_url(self) -> str:
+        """База presigned URL: `S3_ENDPOINT_PUBLIC` либо публичный адрес сайта (Caddy ведёт `/media/*`)."""
+        return (self.s3_endpoint_public or self.base_url).rstrip("/")
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -215,11 +284,14 @@ class Settings(BaseSettings):
         return (init_settings, env_settings, FileSecretsSource(settings_cls))
 
 
-def check_runtime(settings: Settings, *, needs_mail: bool = False) -> None:
+def check_runtime(
+    settings: Settings, *, needs_mail: bool = False, needs_storage: bool = False
+) -> None:
     """Останавливает процесс при старте, если в prod или stage не хватает обязательных значений.
 
     Проверка не входит в валидацию модели: утилиты и тесты создают `Settings` частично.
-    `needs_mail` включает проверку SMTP, она нужна воркеру, но не API.
+    `needs_mail` включает проверку SMTP, она нужна воркеру, но не API; `needs_storage` проверяет
+    адрес и ключи S3, они нужны API и воркеру очереди `media`.
     """
     if not settings.strict_runtime:
         return
@@ -230,8 +302,17 @@ def check_runtime(settings: Settings, *, needs_mail: bool = False) -> None:
         missing.append("JWT_PRIVATE_KEY (или JWT_PRIVATE_KEY_FILE)")
     if needs_mail and settings.smtp_url is None:
         missing.append("SMTP_URL (или SMTP_URL_FILE)")
+    if needs_storage:
+        if not settings.s3_endpoint_internal:
+            missing.append("S3_ENDPOINT_INTERNAL")
+        if settings.s3_access_key is None:
+            missing.append("S3_ACCESS_KEY (или S3_ACCESS_KEY_FILE)")
+        if settings.s3_secret_key is None:
+            missing.append("S3_SECRET_KEY (или S3_SECRET_KEY_FILE)")
     if missing:
         raise RuntimeError(f"APP_ENV={settings.app_env}: не заданы {', '.join(missing)}")
+    if settings.app_env == "prod" and settings.spike_endpoints_enabled:
+        raise RuntimeError("APP_ENV=prod: тестовые ручки SPIKE_ENDPOINTS_ENABLED запрещены")
 
 
 @lru_cache(maxsize=1)

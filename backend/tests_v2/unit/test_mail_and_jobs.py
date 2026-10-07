@@ -16,9 +16,14 @@ from messunjerr.core.jobs import (
     QUEUE_EMAIL,
     QUEUE_MEDIA,
     QUEUES,
+    TASK_CLEANUP_PENDING_UPLOADS,
     TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
     TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
+    TASK_DELETE_MEDIA_OBJECTS,
+    TASK_PROCESS_MEDIA,
+    TASK_RECONCILE_UPLOADS,
     TASK_SEND_EMAIL,
+    TASK_SWEEP_ORPHAN_OBJECTS,
     InMemoryJobQueue,
 )
 from messunjerr.core.mail import (
@@ -309,21 +314,53 @@ def test_email_queue_has_the_send_email_task_with_retries_and_no_stored_result()
     assert function.keep_result_s == 0  # в аргументах токен: результат в Redis не оставляем
 
 
-def test_a_queue_without_tasks_does_not_get_a_worker() -> None:
-    assert functions_for(QUEUE_MEDIA) == []
-    assert cron_jobs_for(QUEUE_MEDIA) == []
+def test_a_queue_without_tasks_does_not_get_a_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Все очереди проекта теперь с задачами; пустую изображаем подменой реестра.
+    def nothing(_queue: str) -> list[Any]:
+        return []
+
+    monkeypatch.setattr("messunjerr.jobs.worker.functions_for", nothing)
+    monkeypatch.setattr("messunjerr.jobs.worker.cron_jobs_for", nothing)
     with pytest.raises(RuntimeError, match="нет задач"):
         build_worker(QUEUE_MEDIA, settings())
+
+
+def test_the_media_queue_has_its_tasks_and_no_schedule() -> None:
+    assert {function.name for function in functions_for(QUEUE_MEDIA)} == {
+        TASK_PROCESS_MEDIA,
+        TASK_DELETE_MEDIA_OBJECTS,
+    }
+    assert cron_jobs_for(QUEUE_MEDIA) == []
+    for function in functions_for(QUEUE_MEDIA):
+        assert function.keep_result_s == 0  # повторная постановка после итога должна проходить
+    process = next(f for f in functions_for(QUEUE_MEDIA) if f.name == TASK_PROCESS_MEDIA)
+    assert (process.max_tries, process.timeout_s) == (3, 120)  # 4.12
+    delete = next(f for f in functions_for(QUEUE_MEDIA) if f.name == TASK_DELETE_MEDIA_OBJECTS)
+    # Самый долгий тайм-аут воркера задаёт время, пока после его смерти задачу никто не возьмёт.
+    assert (delete.max_tries, delete.timeout_s) == (5, 120)
 
 
 def test_default_queue_runs_housekeeping_on_a_schedule() -> None:
     jobs = {job.name: job for job in cron_jobs_for(QUEUE_DEFAULT)}
 
-    assert set(jobs) == {TASK_CLEANUP_UNVERIFIED_ACCOUNTS, TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY}
+    assert set(jobs) == {
+        TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
+        TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
+        TASK_CLEANUP_PENDING_UPLOADS,
+        TASK_RECONCILE_UPLOADS,
+        TASK_SWEEP_ORPHAN_OBJECTS,
+    }
+    sweep = jobs[TASK_SWEEP_ORPHAN_OBJECTS]
+    assert (sweep.hour, sweep.minute) == (4, 20)  # раз в сутки, ночью
     nightly = jobs[TASK_CLEANUP_UNVERIFIED_ACCOUNTS]
     hourly = jobs[TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY]
     assert (nightly.hour, nightly.minute) == (3, 10)  # раз в сутки, ночью
     assert (hourly.hour, hourly.minute) == (None, 17)  # каждый час
+    uploads = jobs[TASK_CLEANUP_PENDING_UPLOADS]
+    assert (uploads.hour, uploads.minute) == (None, 41)  # каждый час (4.12)
+    reconcile = jobs[TASK_RECONCILE_UPLOADS]
+    assert reconcile.hour is None
+    assert reconcile.minute == set(range(0, 60, 5))  # каждые 5 минут
     for job in jobs.values():
         assert job.unique  # несколько воркеров не запускают одну задачу дважды
         assert job.keep_result_s == 0
@@ -337,6 +374,9 @@ def test_the_default_worker_is_built_from_cron_jobs_and_keeps_schedules_in_utc()
     assert set(worker.functions) == {
         TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
         TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
+        TASK_CLEANUP_PENDING_UPLOADS,
+        TASK_RECONCILE_UPLOADS,
+        TASK_SWEEP_ORPHAN_OBJECTS,
     }
     assert worker.timezone is UTC
     assert worker.queue_name == "arq:queue:default"

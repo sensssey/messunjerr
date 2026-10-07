@@ -1,8 +1,10 @@
 """Таблицы схемы `profile` (4.5): профили и настройки приватности.
 
-Внешний ключ на `identity.users` объявлен строкой: таблицу регистрирует модуль моделей identity,
-который импортирует и приложение, и `migrations/env.py`. Столбец `avatar_asset_id` пока без внешнего
-ключа: таблица `media.assets` появится в S5, ключ добавит S6.
+Внешние ключи на `identity.users` и `media.assets` объявлены строками: таблицы регистрируют модули
+моделей identity и media, которые импортируют приложение, воркеры, `seeding` и `migrations/env.py`
+(profiles стоит ниже media в графе контекстов и импортировать его не может). Любой процесс, который
+пишет в `profile.profiles`, обязан импортировать и `messunjerr.media.infra.models`: иначе SQLAlchemy
+на сбросе изменений не найдёт таблицу ключа.
 """
 
 import uuid
@@ -73,7 +75,9 @@ class ProfileRow(Base):
     language: Mapped[str | None] = mapped_column(Text)
     timezone: Mapped[str | None] = mapped_column(Text)
     is_private: Mapped[bool] = mapped_column(server_default=text("false"))
-    avatar_asset_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    avatar_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("media.assets.id", ondelete="SET NULL")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

@@ -117,8 +117,9 @@ def test_settings_are_immutable() -> None:
 
 def test_secret_is_not_printed() -> None:
     settings = make_settings(database_url=DB_URL, redis_url=REDIS_URL)
-    assert "secret" not in repr(settings)
-    assert "secret" not in str(settings.model_dump())
+    # Пароль из адресов не печатается (в `repr` есть имена полей вроде s3_secret_key, но не значения).
+    assert ":secret@" not in repr(settings)
+    assert ":secret@" not in str(settings.model_dump())
 
 
 # ----------------------------------------------------------------------------- логи
@@ -254,7 +255,7 @@ def project_copy(tmp_path: Path) -> Path:
 def test_project_respects_import_contracts(project_copy: Path) -> None:
     result = _lint_imports(project_copy)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 5 kept, 0 broken" in result.stdout
+    assert "Contracts: 6 kept, 0 broken" in result.stdout
 
 
 def test_lower_context_importing_higher_context_breaks_the_build(project_copy: Path) -> None:
@@ -306,6 +307,27 @@ def test_layers_inside_profiles_cannot_import_upwards(
 
 
 @pytest.mark.parametrize(
+    ("layer", "module"),
+    [
+        ("commands", "messunjerr.media.api.schemas"),
+        ("queries", "messunjerr.media.commands.init_upload"),
+        ("domain", "messunjerr.media.infra.models"),
+        ("infra", "messunjerr.media.queries.assets"),
+    ],
+)
+def test_layers_inside_media_cannot_import_upwards(
+    project_copy: Path, layer: str, module: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / "media" / layer / "violation.py").write_text(
+        f"import {module}\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize("context", ["profiles", "media"])
+@pytest.mark.parametrize(
     "module",
     [
         "messunjerr.identity.infra.models",  # модели чужого контекста не импортируем
@@ -317,9 +339,9 @@ def test_layers_inside_profiles_cannot_import_upwards(
     ],
 )
 def test_a_higher_context_may_reach_identity_only_through_its_public_interface(
-    project_copy: Path, module: str
+    project_copy: Path, context: str, module: str
 ) -> None:
-    (project_copy / "src" / "messunjerr" / "profiles" / "violation.py").write_text(
+    (project_copy / "src" / "messunjerr" / context / "violation.py").write_text(
         f"import {module}\n", encoding="utf-8"
     )
     result = _lint_imports(project_copy)
@@ -328,15 +350,33 @@ def test_a_higher_context_may_reach_identity_only_through_its_public_interface(
     assert "api_public" in result.stdout
 
 
+@pytest.mark.parametrize("context", ["profiles", "media"])
 def test_the_public_interface_of_identity_is_importable_from_higher_contexts(
-    project_copy: Path,
+    project_copy: Path, context: str
 ) -> None:
-    (project_copy / "src" / "messunjerr" / "profiles" / "fine.py").write_text(
+    (project_copy / "src" / "messunjerr" / context / "fine.py").write_text(
         "from messunjerr.identity.api_public import PrincipalDep, find_account\n",
         encoding="utf-8",
     )
     result = _lint_imports(project_copy)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_media_may_use_profiles_but_not_the_other_way_round(project_copy: Path) -> None:
+    # media стоит выше profiles в графе 4.2: сверху вниз можно (будущее: аватар в карточке).
+    (project_copy / "src" / "messunjerr" / "media" / "fine.py").write_text(
+        "from messunjerr.profiles import services\n", encoding="utf-8"
+    )
+    assert _lint_imports(project_copy).returncode == 0
+
+    # Снизу вверх нельзя: profiles знает о файлах только через порт `AssetUsage` (собирает main).
+    (project_copy / "src" / "messunjerr" / "media" / "fine.py").unlink()
+    (project_copy / "src" / "messunjerr" / "profiles" / "violation.py").write_text(
+        "from messunjerr.media import services\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
 
 
 def test_core_importing_an_entry_point_breaks_the_build(project_copy: Path) -> None:
@@ -348,10 +388,13 @@ def test_core_importing_an_entry_point_breaks_the_build(project_copy: Path) -> N
     assert "BROKEN" in result.stdout
 
 
-@pytest.mark.parametrize("context", ["core", "identity", "profiles"])
-def test_no_context_may_import_the_seeding_entry_point(project_copy: Path, context: str) -> None:
+@pytest.mark.parametrize("context", ["core", "identity", "profiles", "media"])
+@pytest.mark.parametrize("entry_point", ["seeding", "main", "jobs"])
+def test_no_context_may_import_an_entry_point(
+    project_copy: Path, context: str, entry_point: str
+) -> None:
     (project_copy / "src" / "messunjerr" / context / "violation.py").write_text(
-        "from messunjerr import seeding\n", encoding="utf-8"
+        f"from messunjerr import {entry_point}\n", encoding="utf-8"
     )
     result = _lint_imports(project_copy)
     assert result.returncode != 0

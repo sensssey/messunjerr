@@ -25,3 +25,7 @@ dist/
 
 # Секреты локального стека v2 (создаются `make init`)
 deploy/.env
+
+# Секреты и данные prod-подобного стенда (создаёт scripts/init_prod_like.py)
+deploy/secrets/
+deploy/.stand/

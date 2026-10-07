@@ -1,0 +1,164 @@
+### messunjerr API v2: загрузка файлов (спринт S5)
+#
+# Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
+# значения тогда копируются руками из предыдущего ответа). Стек поднимает `make up` или `./dev.ps1 up`,
+# письма смотрим в Mailpit: http://localhost:8025. Выполняйте запросы по порядку, сверху вниз.
+#
+# Как это устроено: API выдаёт presigned URL, файл клиент загружает ПРЯМО в хранилище (SeaweedFS), затем
+# просит завершить загрузку; проверку и обработку делает воркер `worker-media`. В разработке ссылка
+# ведёт на http://localhost:8333/media/... (порт SeaweedFS), на prod-подобном стенде на
+# https://messunjerr.localhost/media/... через Caddy: для стенда поменяйте @host ниже и доверьте
+# корневому сертификату Caddy (`make stand-ca`).
+
+@host = http://localhost:8000
+@mailpit = http://localhost:8025
+@password = correct horse battery staple
+
+### Подготовка: аккаунт ##################################################################
+
+### 1. Регистрация
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("demo_user", "media_" + suffix);
+    client.global.set("demo_email", "media_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{demo_email}}",
+  "username": "{{demo_user}}",
+  "password": "{{password}}",
+  "accept_terms": true
+}
+
+### 2. Письмо подтверждения в Mailpit (воркер отправляет за секунду-две)
+GET {{mailpit}}/api/v1/search?query=to:{{demo_email}}&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+### 3. Токен подтверждения из текста письма
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("verify_token", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 4. Подтверждение почты и вход
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{verify_token}}" }
+
+> {%
+    client.global.set("access_token", response.body.access_token);
+%}
+
+### Загрузка ##############################################################################
+
+### 5. Заявка: назначение, имя, тип и размер файла (рядом лежит media-sample.png, 70 байт)
+# Размер обязан совпасть с настоящим: подпись ссылки закрепляет и тип, и точный размер.
+# Ответ 201: ресурс `pending` и `upload` (куда и с какими заголовками делать PUT, срок 15 минут).
+# Принимает Idempotency-Key (см. пример ниже). Лимит `upload_init`: 60 заявок в час.
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "post",
+  "filename": "sample.png",
+  "content_type": "image/png",
+  "size_bytes": 70
+}
+
+> {%
+    client.global.set("asset_id", response.body.asset.id);
+    client.global.set("upload_url", response.body.upload.url);
+%}
+
+### 6. Загрузка файла прямо в хранилище (не в API): те же заголовки, что в `upload.headers`
+# Ответ 200 без тела. Другой тип или размер, а также отсутствие If-None-Match дают 403
+# SignatureDoesNotMatch. Запись один раз: повтор этого запроса получит 412 PreconditionFailed
+# (файл уже на месте, остаётся вызвать complete).
+PUT {{upload_url}}
+Content-Type: image/png
+If-None-Match: *
+
+< ./media-sample.png
+
+### 7. Завершить загрузку: сервер проверяет объект (на месте ли, совпадает ли размер)
+# 202 и статус `uploaded`. Повтор безопасен. Нет объекта: 409 upload_missing.
+# Размер не совпал: 422 upload_rejected, поле `reason`.
+POST {{host}}/api/v1/media/uploads/{{asset_id}}/complete
+Authorization: Bearer {{access_token}}
+
+### 8. Состояние ресурса: через секунду-две воркер media ставит `ready` (или `rejected` с причиной)
+# До готовности `urls` равны null; ссылки на файл выдаёт S6.
+GET {{host}}/api/v1/media/{{asset_id}}
+Authorization: Bearer {{access_token}}
+
+### 9. Квота: готовые файлы плюс заявленный размер идущих загрузок
+GET {{host}}/api/v1/media/quota
+Authorization: Bearer {{access_token}}
+
+### 10. Удаление: 204, объект из хранилища убирает фоновая задача
+# Нельзя, пока ресурс привязан к аватару, посту или сообщению: 409 asset_in_use.
+DELETE {{host}}/api/v1/media/{{asset_id}}
+Authorization: Bearer {{access_token}}
+
+### Ошибки ################################################################################
+
+### 11. Несколько проблем сразу: 422 со списком errors[] (purpose_invalid, extension_forbidden, size_invalid)
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "wallpaper",
+  "filename": "setup.exe",
+  "content_type": "application/octet-stream",
+  "size_bytes": 0
+}
+
+### 12. Больше предела назначения: аватар до 5 МиБ (size_exceeds_limit, в meta.max_bytes предел)
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "avatar",
+  "filename": "big.png",
+  "content_type": "image/png",
+  "size_bytes": 6291456
+}
+
+### 13. Идемпотентность: тот же Idempotency-Key и то же тело вернут тот же ресурс (Idempotency-Replayed: true)
+< {%
+    client.global.set("idem_key", $uuid);
+%}
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Idempotency-Key: {{idem_key}}
+Content-Type: application/json
+
+{
+  "purpose": "message",
+  "filename": "notes.txt",
+  "content_type": "text/plain",
+  "size_bytes": 1024
+}
+
+### 14. Повтор того же запроса
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Idempotency-Key: {{idem_key}}
+Content-Type: application/json
+
+{
+  "purpose": "message",
+  "filename": "notes.txt",
+  "content_type": "text/plain",
+  "size_bytes": 1024
+}

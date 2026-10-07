@@ -11,6 +11,8 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from messunjerr.core.migrations import is_known_revision
+
 CHECK_TIMEOUT_SECONDS = 2.0
 
 
@@ -21,7 +23,7 @@ class Readiness:
 
     @property
     def ready(self) -> bool:
-        return all(value in ("ok", "head") for value in self.checks.values())
+        return all(value in ("ok", "head", "ahead") for value in self.checks.values())
 
 
 async def check_postgres(engine: AsyncEngine) -> str:
@@ -43,7 +45,16 @@ async def check_redis(redis: Redis) -> str:
 
 
 async def check_migrations(engine: AsyncEngine, expected: str | None) -> str:
-    """`head`, если БД на ожидаемой ревизии; `behind` или `unknown` иначе."""
+    """Сверяет ревизию БД с ревизией кода.
+
+    - `head`: БД на ожидаемой ревизии;
+    - `ahead`: ревизии нет среди известных коду, то есть БД проведена более новым релизом. Так
+      выглядят старые реплики сразу после миграции при выкладке и предыдущий код при откате.
+      Готовность это не нарушает: миграции обязаны быть совместимы в обе стороны («расширить →
+      мигрировать → сузить», 4.16), иначе выкладка без простоя невозможна (S4);
+    - `behind`: ревизия известна коду, но она не последняя (нужные коду миграции не применены);
+    - `unknown`: ответить не удалось (нет миграций рядом с кодом или БД недоступна).
+    """
     if expected is None:
         return "unknown"
     try:
@@ -52,7 +63,11 @@ async def check_migrations(engine: AsyncEngine, expected: str | None) -> str:
             current = result.scalar_one_or_none()
     except Exception:
         return "unknown"
-    return "head" if current == expected else "behind"
+    if current == expected:
+        return "head"
+    if current is not None and not is_known_revision(current):
+        return "ahead"
+    return "behind"
 
 
 async def run_readiness(engine: AsyncEngine, redis: Redis, expected_head: str | None) -> Readiness:

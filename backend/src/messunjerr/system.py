@@ -21,6 +21,10 @@ class LiveResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+class ServingResponse(BaseModel):
+    status: Literal["serving", "draining"]
+
+
 class ReadyResponse(BaseModel):
     status: Literal["ready", "unavailable"]
     checks: dict[str, str]
@@ -66,12 +70,40 @@ async def live() -> LiveResponse:
 
 
 @health_router.get(
+    "/health/serving",
+    response_model=ServingResponse,
+    responses={
+        503: {"model": ServingResponse, "description": "Процесс закрывается (слив трафика)"}
+    },
+    summary="Принимает трафик (для балансировщика)",
+)
+async def serving(resources: ResourcesDep, response: Response) -> ServingResponse:
+    # Только слив при остановке: по этой ручке Caddy снимает реплику с балансировки раньше, чем
+    # процесс перестанет принимать соединения (S4-03). PostgreSQL и Redis здесь намеренно не
+    # проверяются: общий сбой зависимости вывел бы из балансировки обе реплики сразу, и весь
+    # `/api/*` отвечал бы 503 после ожидания Caddy, а так каждая реплика отвечает ошибкой сама.
+    # `/health/live` при сливе остаётся 200 (иначе Docker счёл бы реплику упавшей).
+    if resources.shutdown.draining:
+        response.status_code = 503
+        return ServingResponse(status="draining")
+    return ServingResponse(status="serving")
+
+
+@health_router.get(
     "/health/ready",
     response_model=ReadyResponse,
-    responses={503: {"model": ReadyResponse, "description": "PostgreSQL или Redis недоступны"}},
-    summary="Готов принимать трафик",
+    responses={
+        503: {
+            "model": ReadyResponse,
+            "description": "PostgreSQL или Redis недоступны либо процесс закрывается (слив трафика)",
+        }
+    },
+    summary="Готов к работе: зависимости и миграции",
 )
 async def ready(resources: ResourcesDep, response: Response) -> ReadyResponse:
+    if resources.shutdown.draining:
+        response.status_code = 503
+        return ReadyResponse(status="unavailable", checks={"shutdown": "draining"}, degraded={})
     report = await run_readiness(resources.engine, resources.redis, resources.expected_head)
     response.status_code = 200 if report.ready else 503
     return ReadyResponse(

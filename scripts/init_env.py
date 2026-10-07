@@ -15,6 +15,11 @@ import secrets
 import sys
 from pathlib import Path
 
+# Переменные, которым в .env больше не место. COMPOSE_PROJECT_NAME перебивал `name:` у любого
+# compose-файла из deploy/ и сажал prod-подобный стенд на тома dev-стека (S4); у compose.dev.yml
+# своё `name:`.
+OBSOLETE = frozenset({"COMPOSE_PROJECT_NAME"})
+
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE = ROOT / "deploy" / ".env.example"
 TARGET = ROOT / "deploy" / ".env"
@@ -49,6 +54,12 @@ def main(argv: list[str]) -> int:
         return 0
 
     existing = TARGET.read_text(encoding="utf-8")
+    lines = existing.splitlines()
+    kept = [line for line in lines if key_of(line) not in OBSOLETE]
+    if len(kept) != len(lines):
+        existing = "\n".join(kept) + "\n"
+        TARGET.write_text(existing, encoding="utf-8", newline="\n")
+        print(f"{TARGET.relative_to(ROOT)}: убрано устаревшее {', '.join(sorted(OBSOLETE))}")
     known = {key_of(line) for line in existing.splitlines()}
     added = [fill(line) for line in example_lines if (key := key_of(line)) and key not in known]
     if not added:

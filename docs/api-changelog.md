@@ -43,3 +43,40 @@
 - На `403 account_deletion_pending` показывать «аккаунт ждёт удаления» с кнопкой «Восстановить» (`POST /me/restore`), а не общую ошибку.
 - Для проверки ника при смене пользоваться `GET /auth/username-available` (учитывает резервы); при `409 username_change_cooldown` показывать `retry_after_days`.
 - Границы полей профиля брать из `GET /meta` (`limits`).
+
+---
+
+## S5. Медиа I: загрузка · 2026-10-07
+
+### ➕ Новые ручки (пять)
+
+| Ручка | Что делает | Ошибки |
+|---|---|---|
+| `POST /media/uploads` | заявка на загрузку: `{ purpose, filename, content_type, size_bytes }`; ответ `201` `{ asset, upload }` с заголовком `Location`; принимает `Idempotency-Key`; лимит `upload_init` (60 в час) | `403 quota_exceeded` (`limit`, `used`), `422` (`purpose_invalid`, `content_type_not_allowed`, `extension_forbidden`, `size_invalid`, `size_exceeds_limit` с `meta.max_bytes`; все проблемы сразу), `503` |
+| `POST /media/uploads/{asset_id}/complete` | завершить загрузку: сервер проверяет объект, ответ `202` `{ asset }` (`uploaded`); повтор возвращает текущее состояние | `404`, `409 upload_missing`, `422 upload_rejected` (поле `reason`), `503` |
+| `GET /media/{asset_id}` | карточка своего ресурса (`Asset`), для опроса статуса | `404` |
+| `DELETE /media/{asset_id}` | удалить свой ресурс, `204`; объекты из хранилища убирает фоновая задача | `404`, `409 asset_in_use` |
+| `GET /media/quota` | `{ used_bytes, limit_bytes, assets_count }` | |
+
+### ✏️ Что важно знать
+
+- **Загрузка идёт мимо API.** Клиент делает `PUT` файла на `upload.url` с заголовками из `upload.headers` (срок `upload.expires_at`, 15 минут). Подпись закрепляет `Content-Type`, **точный** размер и запись один раз (`If-None-Match: *`, этот заголовок тоже в `upload.headers`): другой тип или размер, а также запрос без заголовка дают `403` от хранилища, а повторный `PUT` по той же ссылке `412`, потому что файл уже на месте (проверенный файл подменить нельзя). У не-изображений в `upload.headers` всегда `Content-Type: application/octet-stream`, заявленный тип остаётся в карточке.
+- **Статусы:** `pending` → `uploaded` → `processing` → `ready` | `rejected`; `deleted` для удалённых. До `ready` все `urls` равны `null`; в S5 они пусты и у готовых (ссылки выдаст S6). В S5 «готов» значит «прошёл проверку по сигнатуре»: SVG, HTML и прочее под видом изображения получают `rejected` с `not_an_image`, исполняемые файлы `forbidden_type`, GIF как аватар `unsupported_format`.
+- **Квота** считается по готовым файлам и по заявленному размеру идущих загрузок; незавершённая загрузка освобождает место через 24 часа или после `DELETE`.
+- **`GET /media/quota`** объявлена раньше `GET /media/{asset_id}`: слово `quota` идентификатором не считается.
+- **Лимиты:** `upload_init` (60 заявок в час на человека) вдобавок к `api_write`; `complete` и `DELETE` считаются в `api_write`, чтение в `api_read`.
+
+### ⚠️ Отличия от спецификации (и причины)
+
+- `GET /media/{asset_id}/urls` и публичные адреса аватаров появятся в S6 вместе с обработкой изображений.
+- `PATCH /me/profile` по-прежнему отвечает `asset_not_found` на любой `avatar_asset_id`: порт аватара подключит S6 (задача S6-04).
+- Событий `media.ready` и `media.rejected` по SSE пока нет (S10): статус читается опросом `GET /media/{asset_id}`.
+
+### 🧭 Что делать клиенту
+
+- Цепочка: заявка → `PUT` по `upload.url` (все заголовки из `upload.headers`, ровно столько байт, сколько заявлено) → `complete` → опрашивать `GET /media/{id}` до `ready` или `rejected`.
+- Лимиты размера брать из `GET /meta` (`limits.avatar_max_bytes`, `image_max_bytes`, `file_max_bytes`, `quota_bytes`) и проверять до заявки; запрещённые расширения (`exe`, `bat`, `cmd`, `scr`, `msi`, `ps1`, `js`, `vbs`, `jar`, `apk`) в `/meta` не перечислены, их отвергает `422 extension_forbidden`.
+- К `PUT` добавлять только заголовки из `upload.headers`: заголовки о содержимом (`Content-Encoding`, `Content-Disposition`, `Cache-Control`, `Expires`, `Content-Language`) прокси срезает, неподписанные `X-Amz-*` хранилище отклоняет.
+- Повтор запроса заявки с тем же `Idempotency-Key` вернёт ту же ссылку, и после 15 минут она уже не действует: нужна новая заявка под другим ключом (прежняя освободит квоту через 24 часа или по `DELETE`).
+- Ресурс может долго оставаться в `processing`, если хранилище или воркер были недоступны: файл не отклоняется из-за сбоя инфраструктуры, обработка повторяется сама; опрашивать `GET /media/{id}` с паузой и не пересоздавать загрузку.
+- На `403` при `PUT` просить новую ссылку (`POST /media/uploads`), а не повторять старую; на `412` считать файл загруженным и звать `complete` (после обрыва ответа повтор выглядит именно так); на `409 upload_missing` дозагрузить и повторить `complete`.
