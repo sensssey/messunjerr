@@ -17,7 +17,7 @@ from messunjerr.core.jobs import InMemoryJobQueue
 from messunjerr.core.mail import render_email
 from messunjerr.core.ratelimit import load_buckets
 from messunjerr.main import create_app
-from messunjerr.media.domain.ports import ObjectStorage
+from messunjerr.media.domain.ports import AssetAudience, ObjectStorage
 from messunjerr.settings import Settings
 
 PASSWORD = "correct horse battery staple"
@@ -195,11 +195,15 @@ async def client_with(
     jobs: InMemoryJobQueue,
     *,
     storage: ObjectStorage | None = None,
+    asset_audience: AssetAudience | None = None,
     **overrides: Any,
 ) -> AsyncGenerator[httpx.AsyncClient]:
     """Приложение с другими настройками (`min_age`, паузой смены ника и т.п.); лимиты остаются выключены."""
     application = create_app(
-        test_settings.model_copy(update=overrides), job_queue=jobs, storage=storage
+        test_settings.model_copy(update=overrides),
+        job_queue=jobs,
+        storage=storage,
+        asset_audience=asset_audience,
     )
     async with LifespanManager(application):
         transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)

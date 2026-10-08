@@ -24,6 +24,7 @@ from messunjerr.media.commands import housekeeping as media_housekeeping
 from messunjerr.media.commands.process_media import ProcessMedia
 from messunjerr.media.commands.process_media import process_media as run_process_media
 from messunjerr.media.domain.ports import ObjectStorage, StorageUnavailableError
+from messunjerr.media.infra.images import DecodeBudget
 from messunjerr.settings import Settings
 
 SEND_EMAIL_MAX_TRIES = 5
@@ -74,7 +75,7 @@ async def send_email(
 
 
 async def process_media(ctx: dict[str, Any], *, asset_id: str) -> str:
-    """Обработка загруженного файла (заглушка S5: тип по сигнатуре, S6: перекодирование).
+    """Обработка загруженного файла: тип по содержимому, варианты изображений в WebP без EXIF.
 
     Сбой хранилища повторяется с нарастающей паузой. После последней попытки задача сдаётся, а ресурс
     остаётся в `processing`: недоступное хранилище не повод отклонять и стирать файлы людей, их повторно
@@ -84,11 +85,16 @@ async def process_media(ctx: dict[str, Any], *, asset_id: str) -> str:
     sessionmaker = cast("async_sessionmaker[AsyncSession]", ctx["sessionmaker"])
     storage = cast(ObjectStorage, ctx["storage"])
     jobs = cast(JobQueue, ctx["jobs"])
+    budget = cast("DecodeBudget | None", ctx.get("decode_budget"))
     attempt = int(ctx.get("job_try", 1))
     parsed = uuid.UUID(asset_id)
     try:
         outcome = await run_process_media(
-            ProcessMedia(parsed), sessionmaker=sessionmaker, storage=storage, jobs=jobs
+            ProcessMedia(parsed),
+            sessionmaker=sessionmaker,
+            storage=storage,
+            jobs=jobs,
+            budget=budget,
         )
     except StorageUnavailableError as error:
         if attempt >= PROCESS_MEDIA_MAX_TRIES:
@@ -149,7 +155,7 @@ async def reconcile_uploads(ctx: dict[str, Any]) -> dict[str, int]:
 
 
 async def sweep_orphan_objects(ctx: dict[str, Any]) -> dict[str, int]:
-    """Раз в сутки убирает объекты `uploads/`, которым не соответствует живой ресурс (4.11)."""
+    """Раз в сутки убирает объекты без живого ресурса и доделывает очистку оригиналов (4.11)."""
     sessionmaker = cast("async_sessionmaker[AsyncSession]", ctx["sessionmaker"])
     storage = cast(ObjectStorage, ctx["storage"])
     result = await media_housekeeping.sweep_orphan_objects(sessionmaker, storage)
@@ -157,6 +163,7 @@ async def sweep_orphan_objects(ctx: dict[str, Any]) -> dict[str, int]:
         "scanned": result.scanned,
         "orphans_found": result.orphans_found,
         "removed": result.removed,
+        "scrubbed": result.scrubbed,
     }
 
 

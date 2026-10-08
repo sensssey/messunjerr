@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import io
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -13,12 +14,23 @@ from typing import Any
 
 import httpx
 import pytest
+from PIL import Image
 
 from .conftest import RESET_HINT, Account, Stand
 from .sigv4 import presign_url
 
 MEDIA = "/api/v1/media"
-JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + bytes(range(256)) * 8
+
+
+def _photo() -> bytes:
+    """Настоящий небольшой JPEG: обработка воркером открывает файл целиком."""
+    image = Image.new("RGB", (96, 64), (90, 120, 200))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
+
+
+JPEG = _photo()
 SVG = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'
 PDF = b"%PDF-1.7\n" + b"stand " * 100
 
@@ -106,10 +118,21 @@ async def test_a_file_goes_from_the_browser_to_ready_and_is_removed_with_its_obj
 
     await eventually(is_ready, what="обработка воркером media")
     asset = await status_of(client, account, asset_id)
-    assert (asset["content_type"], asset["size_bytes"]) == ("image/jpeg", len(JPEG))
+    # Фото перекодировано в WebP: место считается по сохранённым вариантам, а не по загрузке.
+    assert asset["content_type"] == "image/webp"
+    assert (asset["width"], asset["height"]) == (96, 64)
+    assert asset["size_bytes"] > 0
+    for name in ("thumb", "medium"):
+        link = asset["urls"][name]
+        assert link.startswith(f"{stand.base_url}/media/uploads/{asset_id}/")
+        shown = await client.get(link)  # так её откроет браузер: через Caddy, по подписи
+        assert shown.status_code == 200, shown.text
+        assert shown.headers["content-type"] == "image/webp"
+    assert asset["urls"]["original"] is None
+    assert (await object_status(stand, asset_id)).content == b""  # оригинал заменён пустым объектом
 
     quota = (await client.get(f"{MEDIA}/quota", headers=account.headers)).json()
-    assert quota["used_bytes"] >= len(JPEG)
+    assert quota["used_bytes"] >= asset["size_bytes"]
     assert quota["assets_count"] >= 1
 
     assert (await object_status(stand, asset_id)).status_code == 200

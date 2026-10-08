@@ -15,6 +15,8 @@ from messunjerr.core.jobs import QUEUE_MEDIA, InMemoryJobQueue
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.media.commands.complete_upload import CompleteUpload, complete_upload
 from messunjerr.media.infra.memory import InMemoryObjectStorage
+from messunjerr.media.queries.presenter import AssetPresenter
+from messunjerr.settings import Settings
 
 from .helpers import bearer, execute, fetch_all, fetch_one, verified_user
 from .media_helpers import (
@@ -514,6 +516,7 @@ async def test_completing_does_not_hold_a_database_connection_while_the_storage_
     client: httpx.AsyncClient,
     jobs: InMemoryJobQueue,
     single_connection_sessions: async_sessionmaker[AsyncSession],
+    test_settings: Settings,
 ) -> None:
     """Зависшее хранилище не должно вытеснять из пула остальные запросы (пул тут из одного соединения)."""
     user = await verified_user(client, jobs)
@@ -529,6 +532,7 @@ async def test_completing_does_not_hold_a_database_connection_while_the_storage_
             uow=uow,
             storage=probing,
             jobs=jobs,
+            presenter=AssetPresenter(probing, test_settings),
         )
 
     assert (asset.status, probing.probes) == ("uploaded", 1)

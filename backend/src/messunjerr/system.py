@@ -1,16 +1,22 @@
-"""Служебные ручки (5.13): здоровье и параметры для клиента."""
+"""Служебные ручки (5.13): здоровье, метрики и параметры для клиента."""
 
 from typing import Literal
 
 from fastapi import APIRouter, Response
 from pydantic import BaseModel
+from redis.exceptions import RedisError
+from sqlalchemy.pool import QueuePool
 
 from messunjerr import __version__
 from messunjerr.core.clock import utcnow
-from messunjerr.core.deps import ResourcesDep
+from messunjerr.core.deps import AppResources, ResourcesDep
 from messunjerr.core.health import run_readiness
+from messunjerr.core.jobs import QUEUES
 from messunjerr.core.limits import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, limits_for_meta
+from messunjerr.core.logs import get_logger
+from messunjerr.core.metrics import METRICS_CONTENT_TYPE, Snapshot, render_metrics
 from messunjerr.core.schemas import UtcDateTime
+from messunjerr.jobs.health import queue_key
 
 # Снаружи эти адреса закрывает Caddy (404): они нужны только оркестратору и мониторингу.
 health_router = APIRouter(tags=["service"])
@@ -110,6 +116,38 @@ async def ready(resources: ResourcesDep, response: Response) -> ReadyResponse:
         status="ready" if report.ready else "unavailable",
         checks=report.checks,
         degraded=report.degraded,
+    )
+
+
+async def _snapshot(resources: AppResources) -> Snapshot:
+    """Состояние на момент опроса: пул соединений БД и глубина очередей arq.
+
+    Недоступный Redis не мешает отдать остальное: очереди просто не попадают в ответ.
+    """
+    pool = resources.engine.sync_engine.pool
+    in_use = pool.checkedout() if isinstance(pool, QueuePool) else 0
+    depth: dict[str, int] = {}
+    for queue in QUEUES:
+        try:
+            depth[queue] = int(await resources.redis.zcard(queue_key(queue)))  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType, reportUnknownArgumentType]
+        except (RedisError, OSError, TimeoutError):
+            get_logger("messunjerr.metrics").debug("queue_depth_unavailable", queue=queue)
+    return Snapshot(
+        pool_in_use=in_use, pool_size=resources.settings.db_pool_size, queue_depth=depth
+    )
+
+
+@health_router.get(
+    "/metrics",
+    include_in_schema=False,
+    summary="Метрики Prometheus",
+)
+async def metrics(resources: ResourcesDep) -> Response:
+    # Только из внутренней сети: Caddy отвечает на /metrics снаружи 404 (4.15).
+    return Response(
+        content=render_metrics(await _snapshot(resources)),
+        media_type=METRICS_CONTENT_TYPE,
+        headers={"Cache-Control": "no-store"},
     )
 
 

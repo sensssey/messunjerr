@@ -18,6 +18,7 @@ ASSET_COLUMNS = {
     "id", "owner_id", "kind", "purpose", "status", "object_key", "original_filename",
     "content_type", "declared_size", "size_bytes", "sha256", "width", "height", "variants",
     "reject_reason", "created_at", "uploaded_at", "processed_at", "deleted_at", "objects_deleted_at",
+    "processing_attempts",
 }  # fmt: skip
 INSUFFICIENT_PRIVILEGE = "42501"
 
@@ -89,6 +90,24 @@ async def test_the_database_refuses_nonsense_values(
             owner=uuid.UUID(user.user_id),
             key=f"uploads/{uuid.uuid4()}/original",
         )
+
+
+async def test_the_decode_attempts_counter_is_required_and_starts_at_zero(
+    client: Any, jobs: Any, admin_engine: AsyncEngine
+) -> None:
+    """Миграция 0005: старые реплики вставляют ресурсы, не зная о столбце, значение берётся по умолчанию."""
+    user = await verified_user(client, jobs)
+    await execute(admin_engine, INSERT, **asset_values(user.user_id))  # без столбца в списке
+
+    row = await fetch_one(admin_engine, "SELECT processing_attempts FROM media.assets")
+    column = await fetch_one(
+        admin_engine,
+        "SELECT is_nullable, data_type FROM information_schema.columns "
+        "WHERE table_schema = 'media' AND table_name = 'assets' AND column_name = 'processing_attempts'",
+    )
+
+    assert row["processing_attempts"] == 0
+    assert (column["is_nullable"], column["data_type"]) == ("NO", "smallint")
 
 
 async def test_an_object_key_belongs_to_one_asset(

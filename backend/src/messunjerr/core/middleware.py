@@ -16,12 +16,44 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from messunjerr.core.codes import ErrorCode
 from messunjerr.core.ids import uuid7
 from messunjerr.core.logs import get_logger
+from messunjerr.core.metrics import (
+    HTTP_DURATION,
+    HTTP_REQUESTS,
+    UNMATCHED_ROUTE,
+    http_method_label,
+)
 from messunjerr.core.problems import problem_response
 
 REQUEST_ID_HEADER = "X-Request-ID"
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _QUIET_PATH_PREFIXES = ("/health/",)
+_UNMETERED_PATHS = frozenset({"/metrics"})
+"""Опрос метрик сам в метрики не попадает."""
+
+
+def route_template(scope: Scope) -> str | None:
+    """Шаблон пути запроса целиком, например `/api/v1/media/{asset_id}`; `None`, если маршрута нет.
+
+    У маршрута в FastAPI 0.142 путь относительный (`/media/{asset_id}`): роутеры подключаются лениво, и
+    префикс подключения лежит не в маршруте. Поэтому недостающее начало берём из пути запроса: настоящее
+    значение относительной части заменяем её шаблоном. Если собрать не удалось, отдаётся то, что есть.
+    """
+    route: Any = scope.get("route")
+    template = getattr(route, "path", None)
+    if not isinstance(template, str):
+        return None
+    path_format = getattr(route, "path_format", None)
+    if isinstance(path_format, str):
+        params: dict[str, Any] = scope.get("path_params") or {}
+        try:
+            actual = path_format.format_map({name: str(value) for name, value in params.items()})
+        except (KeyError, IndexError, ValueError):
+            return template
+        path = str(scope.get("path", ""))
+        if actual and path.endswith(actual):
+            return path[: len(path) - len(actual)] + template
+    return template
 
 
 class RequestContextMiddleware:
@@ -59,18 +91,28 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send_with_request_id)
         finally:
             path = str(scope.get("path", ""))[:200]
-            route: Any = scope.get("route")
             level = "error" if status_code >= 500 else "info"
             if path.startswith(_QUIET_PATH_PREFIXES) and status_code < 500:
                 level = "debug"
+            elapsed = time.perf_counter() - started
+            template = route_template(scope)
             getattr(self._log, level)(
                 "http_request",
                 method=scope.get("method"),
                 path=path,
-                route=getattr(route, "path", None),
+                route=template,
                 status=status_code,
-                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                duration_ms=round(elapsed * 1000, 2),
             )
+            if path not in _UNMETERED_PATHS:
+                # В метку идёт шаблон маршрута, а не путь: иначе каждый идентификатор стал бы
+                # отдельным рядом, а чужие пути (404) вообще не имели бы предела.
+                route_label = template or UNMATCHED_ROUTE
+                method_label = http_method_label(scope.get("method"))
+                HTTP_REQUESTS.labels(
+                    route=route_label, method=method_label, status=str(status_code)
+                ).inc()
+                HTTP_DURATION.labels(route=route_label, method=method_label).observe(elapsed)
             structlog.contextvars.clear_contextvars()
 
 

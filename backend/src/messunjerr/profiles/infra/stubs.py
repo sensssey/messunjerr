@@ -4,6 +4,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from messunjerr.core.uow import UnitOfWork
 from messunjerr.profiles.domain.ports import (
     AvatarCheck,
     ProfileCounts,
@@ -12,12 +13,19 @@ from messunjerr.profiles.domain.ports import (
 
 
 class NoMediaYet:
-    """До S5–S6 ресурсов нет: любой `avatar_asset_id` это `asset_not_found` (план спринтов, S3-02)."""
+    """Без контекста media ресурсов нет: любой `avatar_asset_id` это `asset_not_found`.
+
+    Приложение подставляет настоящую реализацию (`messunjerr.media.commands.avatars`); заглушка нужна
+    тестам, которые собирают профили отдельно.
+    """
 
     async def check(
         self, session: AsyncSession, *, owner_id: uuid.UUID, asset_id: uuid.UUID
     ) -> AvatarCheck:
         return AvatarCheck.NOT_FOUND
+
+    async def release(self, uow: UnitOfWork, *, owner_id: uuid.UUID, asset_id: uuid.UUID) -> None:
+        return None
 
 
 class NoGraphYet:

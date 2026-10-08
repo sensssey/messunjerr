@@ -1,4 +1,4 @@
-"""Маршруты media: `/media/uploads`, `/media/{asset_id}`, `/media/quota` (5.8).
+"""Маршруты media: `/media/uploads`, `/media/{asset_id}`, `/media/{asset_id}/urls`, `/media/quota` (5.8).
 
 Файлы грузятся напрямую в хранилище по presigned URL: через API они не проходят (лимит тела 1 МБ).
 Жизненный цикл ресурса и причины отказов описаны в спецификации 4.11 и 5.8.
@@ -25,8 +25,8 @@ from messunjerr.media.api.schemas import (
 from messunjerr.media.commands.complete_upload import CompleteUpload, complete_upload
 from messunjerr.media.commands.delete_asset import DeleteAsset, delete_asset
 from messunjerr.media.commands.init_upload import InitUpload, init_upload
-from messunjerr.media.queries.assets import get_asset, get_quota
-from messunjerr.media.queries.models import Asset, Quota
+from messunjerr.media.queries.assets import get_asset, get_asset_links, get_quota
+from messunjerr.media.queries.models import Asset, AssetLinks, Quota
 
 _AUTH_ERRORS = {**TOKEN_ERRORS, **problem_responses(ErrorCode.ACCOUNT_DELETION_PENDING)}
 """Ошибки токена и ограничение аккаунта, который ждёт удаления (5.1)."""
@@ -127,6 +127,7 @@ async def complete_upload_endpoint(
         uow=uow,
         storage=media.storage,
         jobs=resources.jobs,
+        presenter=media.presenter,
     )
     return CompleteUploadResponse(asset=asset)
 
@@ -153,16 +154,49 @@ async def quota_endpoint(principal: PrincipalDep, uow: UowDep, resources: Resour
     summary="Карточка ресурса",
     description=(
         "Состояние своего ресурса: для опроса, если SSE недоступен. Пока ресурс не `ready`, "
-        "`urls` равны `null`. Лимит `api_read`."
+        "`urls` равны `null`; у готового это ссылки на варианты (аватар публичный и постоянный, "
+        "остальное presigned GET на 10 минут, срок в `url_expires_at`). Лимит `api_read`."
     ),
     dependencies=[Depends(limit_user("api_read"))],
     responses={**_AUTH_ERRORS, **problem_responses(ErrorCode.NOT_FOUND), **LIMIT_ERRORS},
 )
-async def read_asset_endpoint(asset_id: _ASSET_ID, principal: PrincipalDep, uow: UowDep) -> Asset:
-    asset = await get_asset(uow.session, asset_id=asset_id, owner_id=principal.user_id)
+async def read_asset_endpoint(
+    asset_id: _ASSET_ID, principal: PrincipalDep, uow: UowDep, media: MediaDep
+) -> Asset:
+    asset = await get_asset(
+        uow.session, asset_id=asset_id, owner_id=principal.user_id, presenter=media.presenter
+    )
     if asset is None:
         raise NotFoundError("The asset does not exist or is not yours.")
     return asset
+
+
+@media_router.get(
+    "/{asset_id}/urls",
+    response_model=AssetLinks,
+    summary="Свежие ссылки на файлы",
+    description=(
+        "Новые presigned-ссылки, когда прежние (10 минут) истекли. Доступ у владельца и у тех, кто "
+        "вправе видеть объект, к которому ресурс привязан (видимый пост, беседа, где вы участник). "
+        "Пока ресурс не `ready`, ссылок нет (`null`). Аватары публичны и этой ручки не требуют: их "
+        "адрес в `GET /me` и карточках людей постоянный. Лимит `api_read`."
+    ),
+    dependencies=[Depends(limit_user("api_read"))],
+    responses={**_AUTH_ERRORS, **problem_responses(ErrorCode.NOT_FOUND), **LIMIT_ERRORS},
+)
+async def read_asset_urls_endpoint(
+    asset_id: _ASSET_ID, principal: PrincipalDep, uow: UowDep, media: MediaDep
+) -> AssetLinks:
+    links = await get_asset_links(
+        uow.session,
+        asset_id=asset_id,
+        viewer_id=principal.user_id,
+        presenter=media.presenter,
+        audience=media.audience,
+    )
+    if links is None:
+        raise NotFoundError("The asset does not exist or is not visible to you.")
+    return links
 
 
 @media_router.delete(

@@ -98,6 +98,7 @@ forbidden_modules =
     messunjerr.main
     messunjerr.cli
     messunjerr.seeding
+    messunjerr.tables
     messunjerr.system
     messunjerr.spike
     messunjerr.jobs

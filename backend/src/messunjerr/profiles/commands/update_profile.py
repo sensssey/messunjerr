@@ -5,7 +5,8 @@
 проверяет то, что требует часов, настроек и других контекстов:
 
 - возраст по `birth_date` (`MIN_AGE`, код `underage`; дата в будущем и неправдоподобная `out_of_range`);
-- `avatar_asset_id` через порт медиа (`asset_not_found`, `asset_not_ready`, `asset_wrong_purpose`).
+- `avatar_asset_id` через порт медиа (`asset_not_found`, `asset_not_ready`, `asset_wrong_purpose`);
+  замена и очистка аватара освобождают прежний ресурс (он удаляется вместе с объектами).
 
 Все найденные ошибки приходят одним ответом `422`.
 """
@@ -94,9 +95,12 @@ async def update_profile(
         raise ProfileMissingError(command.user_id)
     await _validate(command, uow=uow, settings=settings, avatars=avatars, today=moment.date())
 
+    previous_avatar = row.avatar_asset_id
     for name, value in command.changes.items():
         if name not in PROFILE_FIELDS:
             raise ValueError(f"unknown profile field: {name}")
         setattr(row, name, (value or None) if name in _EMPTY_IS_NULL else value)
+    if previous_avatar is not None and previous_avatar != row.avatar_asset_id:
+        await avatars.release(uow, owner_id=command.user_id, asset_id=previous_avatar)
     await uow.commit()
     return profile_dto(row)

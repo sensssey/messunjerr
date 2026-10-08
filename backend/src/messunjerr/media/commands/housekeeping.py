@@ -11,14 +11,16 @@
   которых обработка не дошла (задача потерялась при сбое Redis или воркер умер посреди работы), и
   `delete_media_objects` для тех, чьи объекты остались в хранилище. Задачи с детерминированным
   `job_id`, поэтому лишняя постановка дубля не создаёт;
-- `sweep_orphan_objects`: раз в сутки сверяет объекты `uploads/` с таблицей. Объект без строки или со
-  строкой `deleted` и `rejected`, объекты которой уже закрыты отметкой, это сирота (например, `PUT`
-  с медленным телом дописался уже после очистки ресурса, а удаление аккаунта убрало строки
-  каскадом). За один запуск удаляется не больше `MAX_REMOVALS` объектов: ошибка в настройках (БД не
-  та, что у хранилища) не должна стереть всё разом.
+- `sweep_orphan_objects`: раз в сутки сверяет объекты `uploads/` и `public/avatars/` с таблицей.
+  Объект без строки или со строкой `deleted` и `rejected`, объекты которой уже закрыты отметкой, это
+  сирота (например, `PUT` с медленным телом дописался уже после очистки ресурса, а удаление аккаунта
+  убрало строки каскадом). За один запуск удаляется не больше `MAX_REMOVALS` объектов: ошибка в
+  настройках (БД не та, что у хранилища) не должна стереть всё разом. Заодно сверка доделывает
+  очистку: у готового изображения оригинал (с EXIF) должен быть пустым, и если замена после обработки
+  не удалась, её повторяет сверка.
 
-Неприкреплённые `ready` старше 48 часов (4.11) здесь не чистятся: привязок (посты, сообщения) ещё нет,
-знание «прикреплён ли ресурс» появится вместе с ними (S6, S11, S14).
+Неприкреплённые `ready` старше 48 часов (4.11) здесь не чистятся: привязки есть только у аватаров, а
+вложения постов и сообщений появятся в S11 и S14, вместе с ними и знание «прикреплён ли ресурс».
 """
 
 import re
@@ -35,8 +37,16 @@ from messunjerr.core.logs import get_logger
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.media.commands.queueing import enqueue_object_deletion, enqueue_processing
 from messunjerr.media.domain.events import AssetDeleted, record
-from messunjerr.media.domain.ports import ObjectStorage
-from messunjerr.media.domain.rules import UPLOADS_PREFIX, Status
+from messunjerr.media.domain.ports import ObjectStorage, StorageUnavailableError
+from messunjerr.media.domain.rules import (
+    AVATARS_PREFIX,
+    OCTET_STREAM,
+    UPLOADS_PREFIX,
+    Kind,
+    Purpose,
+    Status,
+    object_keys,
+)
 from messunjerr.media.infra.repositories import AssetRepository, AssetState
 
 RECONCILE_GRACE = timedelta(minutes=2)
@@ -51,9 +61,14 @@ ORPHAN_MIN_AGE = timedelta(hours=1)
 MAX_REMOVALS = 500
 """Сколько сирот сверка удаляет за один запуск (защита от массового удаления при ошибке настройки)."""
 
-_UPLOAD_KEY = re.compile(
-    r"^uploads/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/"
+SWEPT_PREFIXES = (UPLOADS_PREFIX, AVATARS_PREFIX)
+"""Что сверяется с таблицей: закрытые объекты и варианты аватаров (единственное публичное место)."""
+
+_ASSET_KEY = re.compile(
+    r"^(?:uploads|public/avatars)/"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^/]+)$"
 )
+_ORIGINAL_NAME = "original"
 
 
 async def _enqueue_safely(jobs: JobQueue, asset_ids: Sequence[uuid.UUID]) -> None:
@@ -126,8 +141,10 @@ async def delete_media_objects(
         pending = [row.id for row in rows]
         keys: list[str] = []
         for row in rows:
-            keys.append(row.object_key)
-            keys.extend(str(key) for key in row.variants.values())
+            # Все ключи, которые обработка могла создать, а не только записанные в карточке: объекта,
+            # которого нет, хранилище не жалеет, а недописанный вариант упавшей обработки в `variants`
+            # не попал, но в bucket мог остаться.
+            keys.extend(object_keys(row.id, Kind(row.kind), Purpose(row.purpose)))
     if not pending:
         return 0
     await storage.delete_many(keys)
@@ -184,11 +201,31 @@ def _is_orphan(state: AssetState | None) -> bool:
     )
 
 
+def _needs_scrub(state: AssetState | None, filename: str, size: int) -> bool:
+    """Оригинал готового изображения должен быть пустым (EXIF с геометкой не хранится).
+
+    Исключения: GIF (его оригинал хранится как есть, `keeps_original`) и готовые изображения времён S5
+    без вариантов: у них оригинал единственная копия, его стирать нельзя (`reprocess-media` сначала
+    сделает варианты). Пустой оригинал уже готов.
+    """
+    return (
+        state is not None
+        and state.status is Status.READY
+        and state.kind is Kind.IMAGE
+        and state.has_variants
+        and not state.keeps_original
+        and filename == _ORIGINAL_NAME
+        and size > 0
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SweepResult:
     scanned: int
     orphans_found: int
     removed: int
+    scrubbed: int = 0
+    """Оригиналы готовых изображений, которые сверка заменила пустыми объектами."""
 
 
 async def sweep_orphan_objects(
@@ -197,41 +234,69 @@ async def sweep_orphan_objects(
     *,
     older_than: timedelta = ORPHAN_MIN_AGE,
     max_removals: int = MAX_REMOVALS,
-    prefix: str = UPLOADS_PREFIX,
+    prefix: str | None = None,
     now: datetime | None = None,
 ) -> SweepResult:
-    """Удаляет объекты `uploads/`, которым не соответствует ни один живой ресурс.
+    """Удаляет объекты, которым не соответствует ни один живой ресурс, и доделывает очистку оригиналов.
 
-    Хранилище читается страницами; к БД идёт по короткому запросу на страницу, так что соединение не
-    занято, пока хранилище отвечает. Ключи не по шаблону `uploads/{id}/…` не трогаются.
+    Просматриваются `uploads/` и `public/avatars/` (или один `prefix`). Хранилище читается
+    страницами; к БД идёт по короткому запросу на страницу, так что соединение не занято, пока
+    хранилище отвечает. Ключи не по шаблону `…/{id}/{имя}` не трогаются. Сирот не больше
+    `max_removals` за запуск, замен оригиналов тоже.
     """
     cutoff = (now or utcnow()) - older_than
-    scanned = found = removed = 0
-    async for page in storage.list_objects(prefix):
-        scanned += len(page)
-        by_asset: dict[uuid.UUID, list[str]] = {}
-        for item in page:
-            match = _UPLOAD_KEY.match(item.key)
-            if match is not None and item.modified_at < cutoff:
-                by_asset.setdefault(uuid.UUID(match.group(1)), []).append(item.key)
-        if not by_asset:
-            continue
-        async with UnitOfWork(sessionmaker) as uow:
-            states = await AssetRepository(uow.session).states(list(by_asset))
-        orphans = [
-            key
-            for asset_id, keys in by_asset.items()
-            if _is_orphan(states.get(asset_id))
-            for key in keys
-        ]
-        found += len(orphans)
-        allowed = orphans[: max(0, max_removals - removed)]
-        if allowed:
-            await storage.delete_many(allowed)
-            removed += len(allowed)
     log = get_logger("messunjerr.media")
+    scanned = found = removed = scrubbed = 0
+    scrub_deferred = False
+    for scanned_prefix in (prefix,) if prefix is not None else SWEPT_PREFIXES:
+        async for page in storage.list_objects(scanned_prefix):
+            scanned += len(page)
+            by_asset: dict[uuid.UUID, list[tuple[str, str, int]]] = {}
+            for item in page:
+                match = _ASSET_KEY.match(item.key)
+                if match is not None and item.modified_at < cutoff:
+                    by_asset.setdefault(uuid.UUID(match.group(1)), []).append(
+                        (item.key, match.group(2), item.size)
+                    )
+            if not by_asset:
+                continue
+            async with UnitOfWork(sessionmaker) as uow:
+                states = await AssetRepository(uow.session).states(list(by_asset))
+            orphans: list[str] = []
+            stale: list[str] = []
+            for asset_id, objects in by_asset.items():
+                state = states.get(asset_id)
+                for key, filename, size in objects:
+                    if _is_orphan(state):
+                        orphans.append(key)
+                    elif _needs_scrub(state, filename, size):
+                        stale.append(key)
+            found += len(orphans)
+            allowed = orphans[: max(0, max_removals - removed)]
+            if allowed:
+                await storage.delete_many(allowed)
+                removed += len(allowed)
+            for key in stale[: max(0, max_removals - scrubbed)]:
+                if scrub_deferred:
+                    break
+                try:
+                    await storage.write_object(key, b"", content_type=OCTET_STREAM)
+                except StorageUnavailableError:
+                    # Замена оригинала не срочнее остальной сверки: сироты ещё впереди, а недостающее
+                    # доделает следующая ночь. Сбой не повод бросать всю сверку.
+                    scrub_deferred = True
+                    log.warning("media_scrub_deferred", key=key)
+                    break
+                scrubbed += 1
     if found > removed:
         log.warning("sweep_orphan_objects_capped", found=found, removed=removed, cap=max_removals)
-    if found:
-        log.info("sweep_orphan_objects", scanned=scanned, found=found, removed=removed)
-    return SweepResult(scanned=scanned, orphans_found=found, removed=removed)
+    if found or scrubbed or scrub_deferred:
+        log.info(
+            "sweep_orphan_objects",
+            scanned=scanned,
+            found=found,
+            removed=removed,
+            scrubbed=scrubbed,
+            scrub_deferred=scrub_deferred,
+        )
+    return SweepResult(scanned=scanned, orphans_found=found, removed=removed, scrubbed=scrubbed)

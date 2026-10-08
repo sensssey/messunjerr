@@ -66,6 +66,7 @@ Authorization: Bearer {{access_token}}
 
 ### 6. Править профиль можно частями: отсутствующий ключ без изменений, null очищает поле
 # Возраст проверяется по birth_date (минимум 18 лет, `MIN_AGE`), ссылки только http и https.
+# Аватар задаётся полем avatar_asset_id (ресурс назначения avatar, media.http), null его убирает.
 PATCH {{host}}/api/v1/me/profile
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
@@ -203,7 +204,9 @@ Content-Type: application/json
 
 { "links": [{ "title": "Скрипт", "url": "javascript:alert(1)" }] }
 
-### Аватар пока недоступен: 422 asset_not_found (загрузки файлов появятся в S5–S6)
+### Чужой или несуществующий ресурс в аватаре: 422 asset_not_found по pointer /body/avatar_asset_id
+# Готовый аватар ставится так же (загрузка и обработка: media.http, шаги 13-19); ещё не обработанный
+# даёт asset_not_ready, ресурс другого назначения asset_wrong_purpose.
 PATCH {{host}}/api/v1/me/profile
 Authorization: Bearer {{access_token}}
 Content-Type: application/json

@@ -28,6 +28,10 @@ dependencies = [
     "tzdata>=2025.2",
     # S5: файлы лежат в S3-хранилище (SeaweedFS, S3 провайдера): presigned URL, HEAD, чтение, удаление
     "aiobotocore>=3.9,<4",
+    # S6: обработка изображений (перекодирование в WebP, варианты, удаление EXIF)
+    "pillow>=12.3,<13",
+    # S6: метрики Prometheus (/metrics у API, отдельный порт у воркеров)
+    "prometheus-client>=0.26,<0.27",
 ]
 
 [project.scripts]

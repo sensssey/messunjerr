@@ -7,7 +7,9 @@
 - столбцы `deleted_at` (когда ресурс удалён) и `objects_deleted_at` (когда его объекты убраны из
   хранилища): без них потерянную постановку `delete_media_objects` нечем найти и осиротевшие объекты
   остались бы в хранилище навсегда (временная схема без Kafka, план спринтов S5-06 и S5-07);
-- индексы `ix_assets_reconcile` и `ix_assets_objects_pending` обслуживают плановую сверку.
+- индексы `ix_assets_reconcile` и `ix_assets_objects_pending` обслуживают плановую сверку;
+- столбец `processing_attempts` (миграция 0005, S6): сколько раз разбор файла начинался и не
+  заканчивался (процесс убит, тайм-аут задачи); на третьем обрыве «ядовитый» файл отклоняется.
 
 Внешний ключ `profile.profiles.avatar_asset_id` на эту таблицу создаёт миграция 0004.
 """
@@ -24,6 +26,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    SmallInteger,
     Text,
     Uuid,
     func,
@@ -98,3 +101,4 @@ class AssetRow(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     objects_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_attempts: Mapped[int] = mapped_column(SmallInteger, server_default=text("0"))

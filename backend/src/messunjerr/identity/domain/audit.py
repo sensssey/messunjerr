@@ -19,6 +19,7 @@ ACCOUNT_UNVERIFIED_PURGED = "account.unverified_purged"
 USERNAME_CHANGED = "username.changed"
 ACCOUNT_DELETION_REQUESTED = "account.deletion_requested"
 ACCOUNT_RESTORED = "account.restored"
+ROLE_CHANGED = "role.changed"
 
 TARGET_USER = "user"
 TARGET_SESSION = "session"

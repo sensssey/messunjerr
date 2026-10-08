@@ -1,14 +1,20 @@
-### messunjerr API v2: загрузка файлов (спринт S5)
+### messunjerr API v2: файлы, изображения и аватары (спринты S5 и S6)
 #
 # Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
 # значения тогда копируются руками из предыдущего ответа). Стек поднимает `make up` или `./dev.ps1 up`,
 # письма смотрим в Mailpit: http://localhost:8025. Выполняйте запросы по порядку, сверху вниз.
 #
 # Как это устроено: API выдаёт presigned URL, файл клиент загружает ПРЯМО в хранилище (SeaweedFS), затем
-# просит завершить загрузку; проверку и обработку делает воркер `worker-media`. В разработке ссылка
-# ведёт на http://localhost:8333/media/... (порт SeaweedFS), на prod-подобном стенде на
-# https://messunjerr.localhost/media/... через Caddy: для стенда поменяйте @host ниже и доверьте
-# корневому сертификату Caddy (`make stand-ca`).
+# просит завершить загрузку; проверку и обработку делает воркер `worker-media`. Изображение
+# перекодируется в WebP-варианты без метаданных (EXIF и геометка пропадают), аватар получает публичные
+# адреса. В разработке ссылка ведёт на http://localhost:8333/media/... (порт SeaweedFS), на prod-подобном
+# стенде на https://messunjerr.localhost/media/... через Caddy: для стенда поменяйте @host ниже и
+# доверьте корневому сертификату Caddy (`make stand-ca`).
+#
+# Файлы для проверки лежат рядом: media-sample.png (настоящая картинка 96×64, 12886 байт) и
+# media-trap.png (SVG с сценарием под видом PNG, 107 байт). Размер в заявке обязан совпасть с настоящим
+# размером файла: подпись ссылки закрепляет и тип, и точный размер. Свою фотографию можно взять так же:
+# поменяйте size_bytes в запросе 5 и путь файла в запросе 6 (тип в обоих: image/jpeg, image/png, image/webp).
 
 @host = http://localhost:8000
 @mailpit = http://localhost:8025
@@ -56,12 +62,11 @@ Content-Type: application/json
     client.global.set("access_token", response.body.access_token);
 %}
 
-### Загрузка ##############################################################################
+### Фото для поста ########################################################################
 
-### 5. Заявка: назначение, имя, тип и размер файла (рядом лежит media-sample.png, 70 байт)
-# Размер обязан совпасть с настоящим: подпись ссылки закрепляет и тип, и точный размер.
+### 5. Заявка: назначение, имя, тип и размер файла
 # Ответ 201: ресурс `pending` и `upload` (куда и с какими заголовками делать PUT, срок 15 минут).
-# Принимает Idempotency-Key (см. пример ниже). Лимит `upload_init`: 60 заявок в час.
+# Принимает Idempotency-Key (см. ниже). Лимит `upload_init`: 60 заявок в час.
 POST {{host}}/api/v1/media/uploads
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
@@ -70,7 +75,7 @@ Content-Type: application/json
   "purpose": "post",
   "filename": "sample.png",
   "content_type": "image/png",
-  "size_bytes": 70
+  "size_bytes": 12886
 }
 
 > {%
@@ -95,22 +100,164 @@ POST {{host}}/api/v1/media/uploads/{{asset_id}}/complete
 Authorization: Bearer {{access_token}}
 
 ### 8. Состояние ресурса: через секунду-две воркер media ставит `ready` (или `rejected` с причиной)
-# До готовности `urls` равны null; ссылки на файл выдаёт S6.
+# У готового фото: content_type `image/webp`, width и height большего варианта, size_bytes = место,
+# которое занимают варианты (оно и идёт в квоту), urls.thumb (320 px) и urls.medium (1280 px по
+# длинной стороне) это presigned GET на 10 минут (url_expires_at). Оригинал после обработки заменён
+# пустым объектом: EXIF с геометкой в хранилище не остаётся. `urls.original` у фото null.
 GET {{host}}/api/v1/media/{{asset_id}}
 Authorization: Bearer {{access_token}}
 
-### 9. Квота: готовые файлы плюс заявленный размер идущих загрузок
+> {%
+    client.global.set("thumb_url", response.body.urls.thumb);
+%}
+
+### 9. Открыть вариант: ссылка работает без токена, пока не истёк срок (подпись в самой ссылке)
+GET {{thumb_url}}
+
+### 10. Свежие ссылки, когда прежние истекли (владелец; позже и те, кто видит пост или беседу)
+GET {{host}}/api/v1/media/{{asset_id}}/urls
+Authorization: Bearer {{access_token}}
+
+### 11. Квота: размер готовых файлов плюс заявленный размер идущих загрузок
 GET {{host}}/api/v1/media/quota
 Authorization: Bearer {{access_token}}
 
-### 10. Удаление: 204, объект из хранилища убирает фоновая задача
+### 12. Удаление: 204, объекты из хранилища убирает фоновая задача
 # Нельзя, пока ресурс привязан к аватару, посту или сообщению: 409 asset_in_use.
 DELETE {{host}}/api/v1/media/{{asset_id}}
 Authorization: Bearer {{access_token}}
 
-### Ошибки ################################################################################
+### Аватар ################################################################################
+# Аватар это изображение назначения `avatar` (JPEG, PNG или WebP, до 5 МиБ). Из него получаются два
+# квадрата по центру кадра, 64 и 256 пикселей, и публичные адреса без подписи с кэшем на год.
 
-### 11. Несколько проблем сразу: 422 со списком errors[] (purpose_invalid, extension_forbidden, size_invalid)
+### 13. Заявка на аватар
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "avatar",
+  "filename": "me.png",
+  "content_type": "image/png",
+  "size_bytes": 12886
+}
+
+> {%
+    client.global.set("avatar_id", response.body.asset.id);
+    client.global.set("avatar_upload_url", response.body.upload.url);
+%}
+
+### 14. Загрузка
+PUT {{avatar_upload_url}}
+Content-Type: image/png
+If-None-Match: *
+
+< ./media-sample.png
+
+### 15. Завершить
+POST {{host}}/api/v1/media/uploads/{{avatar_id}}/complete
+Authorization: Bearer {{access_token}}
+
+### 16. Готов? У аватара urls.thumb и urls.medium это постоянные публичные адреса (url_expires_at null)
+GET {{host}}/api/v1/media/{{avatar_id}}
+Authorization: Bearer {{access_token}}
+
+### 17. Сделать аватаром. Ошибки по pointer /body/avatar_asset_id: asset_not_found (чужой или
+# несуществующий), asset_not_ready (ещё не обработан), asset_wrong_purpose (не аватар).
+# В ответе profile.avatar: {"sm": "/media/public/avatars/<id>/64.webp", "md": ".../256.webp"}.
+# В разработке адрес открывается на порту хранилища: http://localhost:8333 + путь из ответа.
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "avatar_asset_id": "{{avatar_id}}" }
+
+### 18. Тот же аватар в `GET /me` и в карточках людей (`GET /users/{ник}`: user.avatar)
+GET {{host}}/api/v1/me
+Authorization: Bearer {{access_token}}
+
+### 19. Убрать аватар: прежний ресурс удаляется вместе с файлами (замена на другой делает то же самое)
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{ "avatar_asset_id": null }
+
+### Файл для сообщения ####################################################################
+# Не-изображения хранятся как есть и отдаются только как вложение (Content-Disposition: attachment,
+# имя файла очищено), какой бы тип ни заявил клиент.
+
+### 20. Заявка на файл
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "message",
+  "filename": "заметки.txt",
+  "content_type": "text/plain",
+  "size_bytes": 107
+}
+
+> {%
+    client.global.set("file_id", response.body.asset.id);
+    client.global.set("file_upload_url", response.body.upload.url);
+%}
+
+### 21. Загрузка (для файла Content-Type всегда application/octet-stream, смотрите `upload.headers`)
+PUT {{file_upload_url}}
+Content-Type: application/octet-stream
+If-None-Match: *
+
+< ./media-trap.png
+
+### 22. Завершить и дождаться `ready`: у файла urls.original (скачивание), thumb и medium null
+POST {{host}}/api/v1/media/uploads/{{file_id}}/complete
+Authorization: Bearer {{access_token}}
+
+### 23. Карточка файла
+GET {{host}}/api/v1/media/{{file_id}}
+Authorization: Bearer {{access_token}}
+
+### Ловушки: что отклоняет обработка #######################################################
+# Тип определяется по содержимому, а не по заявленному `content_type` и расширению.
+
+### 24. SVG под видом PNG: заявка проходит, обработка отклоняет файл (reject_reason: not_an_image)
+POST {{host}}/api/v1/media/uploads
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "purpose": "post",
+  "filename": "logo.png",
+  "content_type": "image/png",
+  "size_bytes": 107
+}
+
+> {%
+    client.global.set("trap_id", response.body.asset.id);
+    client.global.set("trap_upload_url", response.body.upload.url);
+%}
+
+### 25. Загрузка ловушки
+PUT {{trap_upload_url}}
+Content-Type: image/png
+If-None-Match: *
+
+< ./media-trap.png
+
+### 26. Завершить, затем через секунду `GET` карточки: status rejected, reject_reason not_an_image
+POST {{host}}/api/v1/media/uploads/{{trap_id}}/complete
+Authorization: Bearer {{access_token}}
+
+### 27. Карточка отклонённого файла (объект из хранилища уберёт фоновая задача)
+GET {{host}}/api/v1/media/{{trap_id}}
+Authorization: Bearer {{access_token}}
+
+### Ошибки заявки #########################################################################
+
+### 28. Несколько проблем сразу: 422 со списком errors[] (purpose_invalid, extension_forbidden, size_invalid)
 POST {{host}}/api/v1/media/uploads
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
@@ -122,7 +269,7 @@ Content-Type: application/json
   "size_bytes": 0
 }
 
-### 12. Больше предела назначения: аватар до 5 МиБ (size_exceeds_limit, в meta.max_bytes предел)
+### 29. Больше предела назначения: аватар до 5 МиБ (size_exceeds_limit, в meta.max_bytes предел)
 POST {{host}}/api/v1/media/uploads
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
@@ -134,7 +281,7 @@ Content-Type: application/json
   "size_bytes": 6291456
 }
 
-### 13. Идемпотентность: тот же Idempotency-Key и то же тело вернут тот же ресурс (Idempotency-Replayed: true)
+### 30. Идемпотентность: тот же Idempotency-Key и то же тело вернут тот же ресурс (Idempotency-Replayed: true)
 < {%
     client.global.set("idem_key", $uuid);
 %}
@@ -150,7 +297,7 @@ Content-Type: application/json
   "size_bytes": 1024
 }
 
-### 14. Повтор того же запроса
+### 31. Повтор того же запроса
 POST {{host}}/api/v1/media/uploads
 Authorization: Bearer {{access_token}}
 Idempotency-Key: {{idem_key}}
@@ -162,3 +309,14 @@ Content-Type: application/json
   "content_type": "text/plain",
   "size_bytes": 1024
 }
+
+### Метрики ################################################################################
+# Только для сети разработки (Caddy на стенде снаружи отвечает 404). Формат Prometheus.
+
+### 32. Метрики API: http_requests_total{route,method,status}, http_request_duration_seconds,
+# db_pool_in_use, arq_queue_depth{queue} и стандартные метрики процесса
+GET {{host}}/metrics
+
+### 33. Метрики воркера media: media_processing_seconds{kind,outcome}, media_rejected_total{reason},
+# arq_jobs_total{job,outcome}, arq_jobs_failed_total{job}, arq_job_duration_seconds{job}
+GET http://localhost:9102/metrics

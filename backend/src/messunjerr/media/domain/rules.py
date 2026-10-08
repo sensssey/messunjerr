@@ -7,7 +7,9 @@
 import re
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from enum import StrEnum
+from urllib.parse import quote
 
 from messunjerr.core.limits import LIMITS
 
@@ -36,7 +38,7 @@ class Status(StrEnum):
 
 
 class RejectReason(StrEnum):
-    """Причина отклонения (5.8). Часть причин ставит обработка изображений (S6)."""
+    """Причина отклонения (5.8): размер ставит `complete`, остальное обработка (`process_media`)."""
 
     SIZE_MISMATCH = "size_mismatch"
     SIZE_EXCEEDS_LIMIT = "size_exceeds_limit"
@@ -93,7 +95,7 @@ def signed_content_type(kind: Kind, content_type: str) -> str:
 
     Изображения хранятся с заявленным типом. Остальные файлы всегда как `application/octet-stream`,
     чтобы хранилище никогда не отдало загруженное как `text/html` или SVG: заявленный тип остаётся
-    в карточке ресурса, а выдачу с `Content-Disposition: attachment` делает S6.
+    в карточке ресурса, а выдача идёт с `Content-Disposition: attachment` (`attachment_disposition`).
     """
     return content_type if kind is Kind.IMAGE else OCTET_STREAM
 
@@ -142,10 +144,82 @@ def is_forbidden_extension(filename: str) -> bool:
     return extension_of(filename) in FORBIDDEN_EXTENSIONS
 
 
+def attachment_disposition(filename: str) -> str:
+    """`Content-Disposition` для скачивания файла (RFC 6266 и RFC 5987).
+
+    Имя целиком в `filename*` (UTF-8, процентное кодирование), а `filename` это запасное ASCII-имя
+    для старых клиентов. Кавычки, обратная косая черта и `%` в запасном имени заменяются: значение
+    попадает в заголовок ответа хранилища, и вставить в него чужой параметр или перевод строки нельзя
+    (управляющих символов в очищенном имени нет, но здесь это ещё и проверено).
+    """
+    fallback = (
+        "".join(ch if " " <= ch <= "~" and ch not in '"\\%' else "_" for ch in filename).strip()
+        or DEFAULT_FILENAME
+    )
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+# --------------------------------------------------------------------------------- объекты в bucket
 UPLOADS_PREFIX = "uploads/"
-"""Под этим префиксом лежат загруженные оригиналы: `uploads/{asset_id}/original`."""
+"""Закрытый префикс: оригинал загрузки `uploads/{asset_id}/original` и варианты не-аватаров."""
+
+AVATARS_PREFIX = "public/avatars/"
+"""Единственный публичный префикс (анонимное чтение разрешает SeaweedFS): варианты аватаров."""
+
+WEBP = "image/webp"
+IMAGE_MAX_PIXELS = LIMITS.image_max_pixels
+"""Больше этого числа пикселей изображение отклоняется как `image_too_large` (4.11)."""
+IMAGE_BOMB_PIXELS = 2 * IMAGE_MAX_PIXELS
+"""Больше вдвое: уже `decompression_bomb` (так же делит порог сама Pillow: предупреждение и ошибка)."""
+
+PUBLIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
+"""Варианты аватаров не меняются (при смене аватара появляется новый `asset_id`): кэш на год."""
+PRIVATE_CACHE_CONTROL = "private, max-age=300"
+"""Ссылки на закрытые варианты и файлы живут десять минут: дольше браузеру их держать незачем."""
+
+
+@dataclass(frozen=True, slots=True)
+class VariantSpec:
+    """Один вариант изображения: имя в `variants` и `urls`, сторона в пикселях, имя объекта."""
+
+    name: str
+    size: int
+    """У аватара сторона квадрата, у фото длинная сторона (меньше не масштабируется вверх)."""
+    filename: str
+
+
+AVATAR_VARIANTS = (VariantSpec("thumb", 64, "64.webp"), VariantSpec("medium", 256, "256.webp"))
+PHOTO_VARIANTS = (
+    VariantSpec("thumb", 320, "thumb.webp"),
+    VariantSpec("medium", 1280, "medium.webp"),
+)
+VARIANT_NAMES = ("thumb", "medium")
+ORIGINAL = "original"
+"""Ключ в `variants`: оригинал сохранён и отдаётся (так делается у GIF, 4.11)."""
+
+
+def variant_specs(purpose: Purpose) -> tuple[VariantSpec, ...]:
+    return AVATAR_VARIANTS if purpose in AVATAR_PURPOSES else PHOTO_VARIANTS
 
 
 def object_key(asset_id: uuid.UUID) -> str:
-    """Ключ исходного объекта в bucket. Непубличный префикс: публичны только `public/…` (S6)."""
+    """Ключ исходного объекта в bucket. Непубличный префикс: публичны только аватары (`public/…`)."""
     return f"{UPLOADS_PREFIX}{asset_id}/original"
+
+
+def variant_key(asset_id: uuid.UUID, purpose: Purpose, spec: VariantSpec) -> str:
+    """Ключ варианта: аватары в публичном префиксе, остальное рядом с оригиналом."""
+    prefix = AVATARS_PREFIX if purpose in AVATAR_PURPOSES else UPLOADS_PREFIX
+    return f"{prefix}{asset_id}/{spec.filename}"
+
+
+def object_keys(asset_id: uuid.UUID, kind: Kind, purpose: Purpose) -> list[str]:
+    """Все ключи, которые обработка могла создать для ресурса: оригинал и варианты его назначения.
+
+    Удаление берёт их все, не заглядывая в `variants`: объекта, которого нет, хранилище не жалеет, а
+    недописанный вариант упавшей обработки в карточке не записан, но в bucket мог остаться.
+    """
+    keys = [object_key(asset_id)]
+    if kind is Kind.IMAGE:
+        keys.extend(variant_key(asset_id, purpose, spec) for spec in variant_specs(purpose))
+    return keys

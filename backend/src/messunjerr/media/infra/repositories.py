@@ -9,10 +9,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from messunjerr.media.domain.rules import IN_FLIGHT_STATUSES, Status
+from messunjerr.media.domain.rules import IN_FLIGHT_STATUSES, ORIGINAL, Kind, Status
 from messunjerr.media.infra.models import AssetRow
 
 COUNTED_STATUSES = (*IN_FLIGHT_STATUSES, Status.READY)
@@ -29,6 +29,11 @@ class Usage:
 class AssetState:
     status: Status
     objects_deleted_at: datetime | None
+    kind: Kind
+    has_variants: bool
+    """Обработка S6 прошла: варианты записаны. У готовых изображений времён S5 их нет."""
+    keeps_original: bool
+    """Оригинал хранится как есть (GIF); у остальных изображений на его месте пустой объект."""
 
 
 class AssetRepository:
@@ -58,6 +63,20 @@ class AssetRepository:
             statement = statement.with_for_update().execution_options(populate_existing=True)
         return (await self._session.execute(statement)).scalar_one_or_none()
 
+    async def count_decode_attempt(self, asset_id: uuid.UUID) -> None:
+        """Разбор файла начинается: отметка остаётся, если процесс убьют или задача упрётся в тайм-аут."""
+        await self._session.execute(
+            update(AssetRow)
+            .where(AssetRow.id == asset_id, AssetRow.status == Status.PROCESSING)
+            .values(processing_attempts=AssetRow.processing_attempts + 1)
+        )
+
+    async def clear_decode_attempts(self, asset_id: uuid.UUID) -> None:
+        """Разбор дошёл до конца (хоть бы и отказом): прежние обрывы забываются."""
+        await self._session.execute(
+            update(AssetRow).where(AssetRow.id == asset_id).values(processing_attempts=0)
+        )
+
     async def lock_quota(self, owner_id: uuid.UUID) -> None:
         """Сериализует проверки квоты одного владельца до конца транзакции.
 
@@ -86,11 +105,22 @@ class AssetRepository:
     # --- выборки для плановых задач
     async def states(self, ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, AssetState]:
         """Состояния ресурсов `ids` (включая удалённые); отсутствующих в ответе нет."""
-        statement = select(AssetRow.id, AssetRow.status, AssetRow.objects_deleted_at).where(
-            AssetRow.id.in_(ids)
-        )
+        statement = select(
+            AssetRow.id,
+            AssetRow.status,
+            AssetRow.objects_deleted_at,
+            AssetRow.kind,
+            (AssetRow.variants != {}).label("has_variants"),
+            func.jsonb_exists(AssetRow.variants, ORIGINAL).label("keeps_original"),
+        ).where(AssetRow.id.in_(ids))
         return {
-            row.id: AssetState(Status(row.status), row.objects_deleted_at)
+            row.id: AssetState(
+                Status(row.status),
+                row.objects_deleted_at,
+                Kind(row.kind),
+                bool(row.has_variants),
+                bool(row.keeps_original),
+            )
             for row in (await self._session.execute(statement)).all()
         }
 

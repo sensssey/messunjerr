@@ -9,7 +9,10 @@
 - presigned PUT и GET из `fetch` (подписанные Content-Type и Content-Length);
 - чтение публичного аватара без подписи;
 - загрузка файла по ссылке, которую выдал настоящий API (S5): заявка, `PUT` из `fetch` с заголовками
-  `upload.headers` (в том числе `If-None-Match: *`), повторный `PUT` получает 412, `complete`, `ready`.
+  `upload.headers` (в том числе `If-None-Match: *`), повторный `PUT` получает 412, `complete`, `ready`;
+- обработка (S6): картинку рисует сама страница (canvas, настоящий JPEG и PNG), воркер делает из неё WebP,
+  закрытые варианты открываются по подписанной ссылке, аватар по публичному адресу без подписи
+  (`<img>` загружается, заголовок `Cache-Control: public, max-age=31536000, immutable`).
 
 Как устроено. Современные Chromium и Edge на Windows запускаются «пускачом»: `msedge.exe` порождает
 отдельный процесс браузера и сразу завершается, так что `--dump-dom` ничего не печатает. Поэтому
@@ -322,7 +325,6 @@ class _StandHandler(urllib.request.HTTPSHandler):
 
 OPENER = urllib.request.build_opener(_StandHandler)
 MAILPIT = "http://127.0.0.1:8026"
-UPLOAD_SIZE = 4096
 
 
 def api(method: str, path: str, *, token: str | None = None, body: Any = None) -> tuple[int, Any]:
@@ -380,23 +382,118 @@ def sign_in_new_account() -> str:
     raise RuntimeError("письмо подтверждения не пришло в Mailpit за 30 секунд")
 
 
-PUT_FROM_BROWSER = """(async () => {{
-  const size = {size};
-  const bytes = new Uint8Array(size);
-  bytes.set([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00]);
-  for (let i = 11; i < size; i++) bytes[i] = i % 251;
+MAKE_IMAGE = """(async () => {{
+  const canvas = document.createElement('canvas');
+  canvas.width = {width};
+  canvas.height = {height};
+  const context = canvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, {width}, {height});
+  gradient.addColorStop(0, '#d94f3d');
+  gradient.addColorStop(1, '#3d7ad9');
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, {width}, {height});
+  context.fillStyle = '#ffffff';
+  context.font = '32px sans-serif';
+  context.fillText('messunjerr', 16, 48);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, {mime}, 0.9));
+  window.__file = blob;
+  return blob.size;
+}})()"""
+
+PUT_FILE = """(async () => {{
+  const blob = window.__file;
   const url = {url};
   const headers = {headers};
-  const first = await fetch(url, {{method: 'PUT', headers, body: new Blob([bytes])}});
-  const other = bytes.slice();
-  other[size - 1] ^= 0xff;
-  const second = await fetch(url, {{method: 'PUT', headers, body: new Blob([other])}});
+  const first = await fetch(url, {{method: 'PUT', headers, body: blob}});
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  bytes[bytes.length - 1] ^= 0xff;
+  const second = await fetch(url, {{method: 'PUT', headers, body: new Blob([bytes])}});
   return JSON.stringify([first.status, second.status]);
 }})()"""
 
+LOAD_IMAGE = """(async () => {{
+  const url = {url};
+  const response = await fetch(url);
+  const buffer = await response.arrayBuffer();
+  const size = await new Promise((resolve) => {{
+    const image = new Image();
+    image.onload = () => resolve([image.naturalWidth, image.naturalHeight]);
+    image.onerror = () => resolve([0, 0]);
+    image.src = url;
+  }});
+  return JSON.stringify([response.status, response.headers.get('content-type'),
+    response.headers.get('cache-control'), buffer.byteLength, size]);
+}})()"""
+
+PUBLIC_CACHE = "public, max-age=31536000, immutable"
+
+
+def upload_from_browser(
+    page: DevTools,
+    token: str,
+    report: list[str],
+    *,
+    purpose: str,
+    mime: str,
+    filename: str,
+    width: int,
+    height: int,
+) -> dict[str, Any] | None:
+    """Картинку рисует страница, `PUT` идёт из `fetch`; возвращает карточку готового ресурса."""
+    size = int(
+        evaluate(
+            page,
+            MAKE_IMAGE.format(width=width, height=height, mime=json.dumps(mime)),
+            wait_for_promise=True,
+        )
+    )
+    status, created = api(
+        "POST",
+        "/media/uploads",
+        token=token,
+        body={"purpose": purpose, "filename": filename, "content_type": mime, "size_bytes": size},
+    )
+    if status != 201:
+        report.append(f"НЕТ: заявка ({purpose}): {status} {created}")
+        return None
+    upload, asset_id = created["upload"], created["asset"]["id"]
+    expression = PUT_FILE.format(url=json.dumps(upload["url"]), headers=json.dumps(upload["headers"]))
+    statuses = json.loads(str(evaluate(page, expression, wait_for_promise=True)))
+    report.append(
+        f"{purpose}: {mime} {width}x{height}, {size} байт; PUT из браузера {statuses[0]}, повторный PUT {statuses[1]}"
+    )
+    if statuses != [200, 412]:
+        report.append("НЕТ: ожидалось [200, 412] (запись один раз)")
+        return None
+    status, done = api("POST", f"/media/uploads/{asset_id}/complete", token=token)
+    report.append(f"{purpose}: complete {status}, статус {(done or {}).get('asset', {}).get('status')}")
+    asset: dict[str, Any] = {}
+    for _ in range(60):
+        status, body = api("GET", f"/media/{asset_id}", token=token)
+        asset = body or {}
+        if asset.get("status") in ("ready", "rejected"):
+            break
+        time.sleep(0.5)
+    report.append(
+        f"{purpose}: воркер media {asset.get('status')}, тип {asset.get('content_type')}, "
+        f"размер {asset.get('width')}x{asset.get('height')}, {asset.get('size_bytes')} байт"
+    )
+    if status != 200 or asset.get("status") != "ready":
+        report.append(f"НЕТ: {purpose} не дошёл до ready ({asset.get('reject_reason')})")
+        return None
+    return asset
+
+
+def look(page: DevTools, url: str) -> list[Any]:
+    """Как адрес видит страница: [код, тип, Cache-Control, размер тела, [ширина, высота] в <img>]."""
+    parsed: list[Any] = json.loads(
+        str(evaluate(page, LOAD_IMAGE.format(url=json.dumps(url)), wait_for_promise=True))
+    )
+    return parsed
+
 
 def check_upload_through_api(browser: str) -> list[str]:
-    """Загрузка файла так, как её сделает фронтенд: заявка в API, `PUT` из `fetch` по выданной ссылке.
+    """Загрузка и обработка так, как их сделает фронтенд: заявка в API, `PUT` из `fetch` по выданной ссылке.
 
     Возвращает строки отчёта; в начале строки `НЕТ`, если что-то не прошло.
     """
@@ -405,21 +502,6 @@ def check_upload_through_api(browser: str) -> list[str]:
         token = sign_in_new_account()
     except (RuntimeError, OSError) as error:  # например, исчерпан лимит регистраций с одного адреса
         return [f"НЕТ: нет аккаунта для проверки: {error}"]
-    status, created = api(
-        "POST",
-        "/media/uploads",
-        token=token,
-        body={
-            "purpose": "post",
-            "filename": "browser.jpg",
-            "content_type": "image/jpeg",
-            "size_bytes": UPLOAD_SIZE,
-        },
-    )
-    if status != 201:
-        return [f"НЕТ: заявка на загрузку: {status} {created}"]
-    upload, asset_id = created["upload"], created["asset"]["id"]
-    report.append(f"заявка: 201, заголовки для PUT {upload['headers']}")
 
     # Страница того же происхождения, что и /media/*: запрос без CORS, как у настоящего фронтенда.
     with open_page(browser, f"{SITE}/") as page:
@@ -427,28 +509,36 @@ def check_upload_through_api(browser: str) -> list[str]:
             if evaluate(page, "document.readyState") == "complete":
                 break
             time.sleep(0.25)
-        expression = PUT_FROM_BROWSER.format(
-            size=UPLOAD_SIZE, url=json.dumps(upload["url"]), headers=json.dumps(upload["headers"])
-        )
-        statuses = json.loads(str(evaluate(page, expression, wait_for_promise=True)))
-    report.append(f"PUT из браузера: {statuses[0]}, повторный PUT: {statuses[1]}")
-    if statuses != [200, 412]:
-        report.append("НЕТ: ожидалось [200, 412] (запись один раз)")
-        return report
 
-    status, done = api("POST", f"/media/uploads/{asset_id}/complete", token=token)
-    report.append(f"complete: {status}, статус {(done or {}).get('asset', {}).get('status')}")
-    final = ""
-    for _ in range(60):
-        status, asset = api("GET", f"/media/{asset_id}", token=token)
-        final = str((asset or {}).get("status"))
-        if final in ("ready", "rejected"):
-            break
-        time.sleep(0.5)
-    report.append(f"воркер media: {final}, тип {(asset or {}).get('content_type')}")
-    if status != 200 or final != "ready":
-        report.append("НЕТ: файл не дошёл до ready")
-    api("DELETE", f"/media/{asset_id}", token=token)
+        photo = upload_from_browser(
+            page, token, report, purpose="post", mime="image/jpeg", filename="browser.jpg", width=640, height=480
+        )
+        if photo is None:
+            return report
+        for name, expected in (("thumb", [320, 240]), ("medium", [640, 480])):
+            seen = look(page, photo["urls"][name])
+            report.append(f"фото, вариант {name}: {seen}")
+            if seen[0] != 200 or seen[1] != "image/webp" or seen[4] != expected:
+                report.append(f"НЕТ: вариант {name} должен быть image/webp {expected}")
+        api("DELETE", f"/media/{photo['id']}", token=token)
+
+        avatar = upload_from_browser(
+            page, token, report, purpose="avatar", mime="image/png", filename="me.png", width=300, height=200
+        )
+        if avatar is None:
+            return report
+        status, profile = api("PATCH", "/me/profile", token=token, body={"avatar_asset_id": avatar["id"]})
+        if status != 200:
+            report.append(f"НЕТ: аватар не назначен: {status} {profile}")
+            return report
+        paths = profile["avatar"]
+        report.append(f"аватар назначен: {paths}")
+        for name, expected in (("sm", [64, 64]), ("md", [256, 256])):
+            seen = look(page, paths[name])  # относительный адрес из профиля, без подписи и токена
+            report.append(f"аватар {name}: {seen}")
+            if seen[0] != 200 or seen[1] != "image/webp" or seen[4] != expected or seen[2] != PUBLIC_CACHE:
+                report.append(f"НЕТ: аватар {name} должен быть image/webp {expected} с кэшем на год")
+        api("PATCH", "/me/profile", token=token, body={"avatar_asset_id": None})
     return report
 
 
@@ -492,7 +582,7 @@ def main() -> int:
         print("\nНЕ НАЙДЕНО в журнале:", *missing, sep="\n  ")
         return 1
 
-    print("\nзагрузка файла через API (S5):")
+    print("\nзагрузка и обработка через API (S5, S6):")
     upload_report = check_upload_through_api(browser)
     for line in upload_report:
         print(" ", line)

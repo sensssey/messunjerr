@@ -27,16 +27,12 @@ from messunjerr.settings import Settings
 
 from .helpers import execute, fetch_all, fetch_one, verified_user
 from .media_helpers import (
-    EXE,
     GIF,
     JPEG,
     PDF,
-    PNG,
-    SVG,
     ProbingStorage,
     key_of,
     put_object,
-    read_asset,
     started,
     uploaded,
 )
@@ -81,129 +77,8 @@ async def run_processing(
 
 
 # ----------------------------------------------------------------------------- process_media
-@pytest.mark.parametrize(
-    ("body", "declared", "mime"),
-    [
-        (JPEG, "image/jpeg", "image/jpeg"),
-        (PNG, "image/png", "image/png"),
-        (JPEG, "image/png", "image/jpeg"),  # заявили PNG, внутри JPEG: решает содержимое
-        (GIF, "image/gif", "image/gif"),
-    ],
-)
-async def test_real_images_become_ready_with_the_type_from_the_content(
-    client: httpx.AsyncClient,
-    jobs: InMemoryJobQueue,
-    storage: InMemoryObjectStorage,
-    sessionmaker: Sessions,
-    admin_engine: AsyncEngine,
-    body: bytes,
-    declared: str,
-    mime: str,
-) -> None:
-    user = await verified_user(client, jobs)
-    created = await uploaded(client, user, storage, body, content_type=declared)
-    asset_id = created["asset"]["id"]
-
-    outcome = await run_processing(asset_id, sessionmaker, storage, jobs)
-
-    assert outcome is Outcome.READY
-    row = await row_of(admin_engine, asset_id)
-    assert (row["status"], row["content_type"]) == ("ready", mime)
-    assert row["processed_at"] is not None
-    assert row["reject_reason"] is None
-    assert await events_of(admin_engine) == ["AssetUploaded", "AssetProcessed"]
-    assert jobs.named("delete_media_objects") == []
-    assert (await read_asset(client, user, asset_id)).json()["status"] == "ready"
-
-
-@pytest.mark.parametrize(
-    ("overrides", "body", "reason"),
-    [
-        ({"content_type": "image/png"}, SVG, "not_an_image"),  # SVG под видом PNG
-        ({"content_type": "image/jpeg"}, PDF, "not_an_image"),
-        ({"content_type": "image/png"}, b"MZ plain text posing as an image", "not_an_image"),
-        ({"purpose": "avatar", "content_type": "image/png"}, GIF, "unsupported_format"),
-        ({"purpose": "group_avatar", "content_type": "image/webp"}, GIF, "unsupported_format"),
-        (
-            {
-                "content_type": "application/octet-stream",
-                "filename": "tool.dat",
-                "purpose": "message",
-            },
-            EXE,
-            "forbidden_type",
-        ),
-    ],
-)
-async def test_traps_are_rejected_with_a_reason_and_their_objects_are_queued_for_removal(
-    client: httpx.AsyncClient,
-    jobs: InMemoryJobQueue,
-    storage: InMemoryObjectStorage,
-    sessionmaker: Sessions,
-    admin_engine: AsyncEngine,
-    overrides: dict[str, Any],
-    body: bytes,
-    reason: str,
-) -> None:
-    user = await verified_user(client, jobs)
-    created = await uploaded(client, user, storage, body, **overrides)
-    asset_id = created["asset"]["id"]
-
-    outcome = await run_processing(asset_id, sessionmaker, storage, jobs)
-
-    assert outcome is Outcome.REJECTED
-    row = await row_of(admin_engine, asset_id)
-    assert (row["status"], row["reject_reason"]) == ("rejected", reason)
-    assert await events_of(admin_engine) == ["AssetUploaded", "AssetRejected"]
-    (job,) = jobs.named("delete_media_objects")
-    assert job.kwargs == {"asset_ids": [asset_id]}
-    asset = (await read_asset(client, user, asset_id)).json()
-    assert (asset["status"], asset["reject_reason"]) == ("rejected", reason)
-
-
-async def test_ordinary_files_are_accepted_and_keep_their_declared_type(
-    client: httpx.AsyncClient,
-    jobs: InMemoryJobQueue,
-    storage: InMemoryObjectStorage,
-    sessionmaker: Sessions,
-    admin_engine: AsyncEngine,
-) -> None:
-    user = await verified_user(client, jobs)
-    created = await uploaded(
-        client,
-        user,
-        storage,
-        PDF,
-        purpose="message",
-        filename="a.pdf",
-        content_type="application/pdf",
-    )
-    asset_id = created["asset"]["id"]
-
-    assert await run_processing(asset_id, sessionmaker, storage, jobs) is Outcome.READY
-    row = await row_of(admin_engine, asset_id)
-    assert (row["status"], row["content_type"], row["kind"]) == ("ready", "application/pdf", "file")
-
-
-async def test_an_object_that_vanished_is_rejected_as_a_processing_failure(
-    client: httpx.AsyncClient,
-    jobs: InMemoryJobQueue,
-    storage: InMemoryObjectStorage,
-    sessionmaker: Sessions,
-    admin_engine: AsyncEngine,
-) -> None:
-    user = await verified_user(client, jobs)
-    created = await uploaded(client, user, storage)
-    storage.objects.clear()
-
-    outcome = await run_processing(created["asset"]["id"], sessionmaker, storage, jobs)
-
-    assert outcome is Outcome.REJECTED
-    assert (await row_of(admin_engine, created["asset"]["id"]))[
-        "reject_reason"
-    ] == "processing_failed"
-
-
+# Обработка изображений и файлов, отказы и ловушки проверяет test_media_processing.py; здесь
+# то, что касается самих задач: пропуск лишнего, повтор, гонка с удалением, обёртка arq.
 async def test_processing_does_nothing_for_assets_that_are_not_waiting_for_it(
     client: httpx.AsyncClient,
     jobs: InMemoryJobQueue,
@@ -528,23 +403,38 @@ async def test_cleanup_survives_a_queue_outage_and_leaves_the_removal_to_reconci
 
 
 # ----------------------------------------------------------------------------- delete_media_objects
-async def test_object_removal_deletes_the_original_and_the_variants_and_marks_the_row(
+@pytest.mark.parametrize(
+    ("overrides", "extra"),
+    [
+        ({}, ["uploads/{id}/thumb.webp", "uploads/{id}/medium.webp"]),
+        ({"purpose": "avatar"}, ["public/avatars/{id}/64.webp", "public/avatars/{id}/256.webp"]),
+        (
+            {"purpose": "message", "content_type": "application/pdf", "filename": "a.pdf"},
+            [],
+        ),
+    ],
+)
+async def test_object_removal_deletes_the_original_and_all_variants_and_marks_the_row(
     client: httpx.AsyncClient,
     jobs: InMemoryJobQueue,
     storage: InMemoryObjectStorage,
     sessionmaker: Sessions,
     admin_engine: AsyncEngine,
+    overrides: dict[str, Any],
+    extra: list[str],
 ) -> None:
     user = await verified_user(client, jobs)
-    created = await uploaded(client, user, storage)
+    body = PDF if overrides.get("content_type") == "application/pdf" else JPEG
+    created = await uploaded(client, user, storage, body, **overrides)
     asset_id = created["asset"]["id"]
-    storage.put("variants/x/thumb.webp", b"t")
-    storage.put("variants/x/medium.webp", b"m")
+    variant_keys = [pattern.format(id=asset_id) for pattern in extra]
+    for key in variant_keys:
+        storage.put(
+            key, b"v"
+        )  # варианты, которые записала обработка (в карточке их может и не быть)
     await execute(
         admin_engine,
-        "UPDATE media.assets SET status = 'deleted', deleted_at = now(), "
-        "variants = CAST(:variants AS jsonb) WHERE id = :id",
-        variants='{"thumb": "variants/x/thumb.webp", "medium": "variants/x/medium.webp"}',
+        "UPDATE media.assets SET status = 'deleted', deleted_at = now() WHERE id = :id",
         id=uuid.UUID(asset_id),
     )
 
@@ -554,11 +444,7 @@ async def test_object_removal_deletes_the_original_and_the_variants_and_marks_th
 
     assert done == 1
     assert storage.objects == {}
-    assert set(storage.deleted) == {
-        key_of(created),
-        "variants/x/thumb.webp",
-        "variants/x/medium.webp",
-    }
+    assert set(storage.deleted) == {key_of(created), *variant_keys}
     assert (await row_of(admin_engine, asset_id))["objects_deleted_at"] is not None
     # Повтор ничего не делает: объекты уже убраны.
     assert (
@@ -801,6 +687,12 @@ async def test_the_sweep_removes_only_objects_without_a_living_asset(
             marked=marked,
             id=uuid.UUID(created["asset"]["id"]),
         )
+    await execute(
+        admin_engine,
+        "UPDATE media.assets SET variants = CAST(:variants AS jsonb) WHERE id = :id",
+        variants='{"thumb": {}, "medium": {}}',  # обработан: варианты записаны
+        id=uuid.UUID(ready["asset"]["id"]),
+    )
     without_row, young = orphan_key(), orphan_key()
     storage.put(without_row, b"x")
     storage.put(young, b"x")
@@ -820,10 +712,171 @@ async def test_the_sweep_removes_only_objects_without_a_living_asset(
 
     assert set(storage.deleted) == {keys["window_closed"], keys["rejected_closed"], without_row}
     assert (result.orphans_found, result.removed) == (3, 3)
-    assert result.scanned == len(keys) + 3  # без объекта вне префикса `uploads/`
+    assert result.scanned == len(keys) + 4  # без объекта вне `uploads/` и `public/avatars/`
     survivors = set(storage.objects)
     assert {keys["pending"], keys["ready"], keys["waiting"], keys["window_open"]} <= survivors
     assert {young, "uploads/readme.txt", "public/avatars/a/64.webp"} <= survivors
+    # Готовое изображение: его оригинал (с EXIF) сверка заменила пустым объектом, а не удалила.
+    assert result.scrubbed == 1
+    assert storage.objects[keys["ready"]][0] == b""
+    assert storage.objects[keys["waiting"]][0] == JPEG  # ещё не обработан: оригинал нужен
+
+
+async def set_state(
+    engine: AsyncEngine,
+    created: dict[str, Any],
+    status: str,
+    *,
+    marked: bool = False,
+    **columns: str,
+) -> None:
+    extra = "".join(f", {name} = CAST(:{name} AS jsonb)" for name in columns)
+    await execute(
+        engine,
+        f"UPDATE media.assets SET status = :status, "
+        f"objects_deleted_at = CASE WHEN :marked THEN now() END{extra} WHERE id = :id",
+        status=status,
+        marked=marked,
+        id=uuid.UUID(created["asset"]["id"]),
+        **columns,
+    )
+
+
+async def test_the_sweep_looks_after_the_public_avatar_variants_too(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    storage: InMemoryObjectStorage,
+    sessionmaker: Sessions,
+    admin_engine: AsyncEngine,
+) -> None:
+    user = await verified_user(client, jobs)
+    living = await uploaded(client, user, storage, JPEG, purpose="avatar")
+    gone = await uploaded(client, user, storage, JPEG, purpose="avatar")
+    await set_state(admin_engine, living, "ready", variants='{"thumb": {}, "medium": {}}')
+    await set_state(admin_engine, gone, "deleted", marked=True)
+    nameless = str(uuid.uuid4())
+    keys = {
+        "living": [
+            f"public/avatars/{living['asset']['id']}/{name}" for name in ("64.webp", "256.webp")
+        ],
+        "gone": [
+            f"public/avatars/{gone['asset']['id']}/{name}" for name in ("64.webp", "256.webp")
+        ],
+        "nameless": [f"public/avatars/{nameless}/64.webp"],
+    }
+    for key in [key for group in keys.values() for key in group]:
+        storage.put(key, b"w")
+    old_enough(storage, *[key for group in keys.values() for key in group])
+
+    result = await housekeeping.sweep_orphan_objects(sessionmaker, storage)
+
+    assert set(storage.deleted) >= {*keys["gone"], *keys["nameless"]}
+    assert set(keys["living"]) <= set(storage.objects)  # живой аватар не трогаем
+    assert not set(storage.deleted) & set(keys["living"])
+    assert result.orphans_found == 3
+
+
+async def test_the_sweep_finishes_the_scrub_of_originals_of_ready_images_only(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    storage: InMemoryObjectStorage,
+    sessionmaker: Sessions,
+    admin_engine: AsyncEngine,
+) -> None:
+    user = await verified_user(client, jobs)
+    photo = await uploaded(client, user, storage, JPEG)  # готов, а оригинал не заменили
+    legacy = await uploaded(client, user, storage, JPEG)  # готов по заглушке S5: вариантов нет
+    kept_gif = await uploaded(client, user, storage, GIF, content_type="image/gif")
+    document = await uploaded(
+        client,
+        user,
+        storage,
+        PDF,
+        purpose="message",
+        content_type="application/pdf",
+        filename="a.pdf",
+    )
+    already_empty = await uploaded(client, user, storage, JPEG)
+    waiting = await uploaded(client, user, storage, JPEG)
+    for created in (legacy, document):
+        await set_state(admin_engine, created, "ready")
+    for created in (photo, already_empty):
+        await set_state(admin_engine, created, "ready", variants='{"thumb": {}, "medium": {}}')
+    await set_state(
+        admin_engine, kept_gif, "ready", variants='{"thumb": {}, "original": {"key": "x"}}'
+    )
+    storage.put(key_of(already_empty), b"")
+    keys = [
+        key_of(created) for created in (photo, legacy, kept_gif, document, already_empty, waiting)
+    ]
+    old_enough(storage, *keys)
+
+    result = await housekeeping.sweep_orphan_objects(sessionmaker, storage)
+
+    assert result.scrubbed == 1
+    assert storage.writes == [key_of(photo)]
+    assert storage.objects[key_of(photo)][0] == b""
+    assert (
+        storage.objects[key_of(legacy)][0] == JPEG
+    )  # единственная копия: сначала `reprocess-media`
+    assert storage.objects[key_of(kept_gif)][0] == GIF  # анимацию храним как есть
+    assert storage.objects[key_of(document)][0] == PDF  # файл не трогаем
+    assert storage.objects[key_of(waiting)][0] == JPEG  # ещё не обработан
+    again = await housekeeping.sweep_orphan_objects(sessionmaker, storage)
+    assert again.scrubbed == 0  # пустое второй раз не переписывается
+
+
+async def test_the_scrub_is_capped_per_run_too(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    storage: InMemoryObjectStorage,
+    sessionmaker: Sessions,
+    admin_engine: AsyncEngine,
+) -> None:
+    user = await verified_user(client, jobs)
+    created = [await uploaded(client, user, storage, JPEG) for _ in range(3)]
+    for item in created:
+        await set_state(admin_engine, item, "ready", variants='{"thumb": {}, "medium": {}}')
+    old_enough(storage, *[key_of(item) for item in created])
+
+    first = await housekeeping.sweep_orphan_objects(sessionmaker, storage, max_removals=2)
+    second = await housekeeping.sweep_orphan_objects(sessionmaker, storage, max_removals=2)
+
+    assert (first.scrubbed, second.scrubbed) == (2, 1)
+
+
+class RefusesToScrub(InMemoryObjectStorage):
+    """Запись пустого объекта вместо оригинала не удаётся, остальное хранилище в порядке."""
+
+    async def write_object(
+        self, key: str, body: bytes, *, content_type: str, cache_control: str | None = None
+    ) -> None:
+        raise StorageUnavailableError("write is refused")
+
+
+async def test_a_refused_scrub_does_not_abort_the_rest_of_the_sweep(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    storage: InMemoryObjectStorage,
+    sessionmaker: Sessions,
+    admin_engine: AsyncEngine,
+) -> None:
+    """Дефект из ревью: первый же сбой записи обрывал сверку, и сироты ждали ещё сутки."""
+    user = await verified_user(client, jobs)
+    photo = await uploaded(client, user, storage, JPEG)
+    await set_state(admin_engine, photo, "ready", variants='{"thumb": {}, "medium": {}}')
+    refusing = RefusesToScrub()  # то же содержимое, но запись пустого объекта отклоняется
+    refusing.page_size = 1  # сирота лежит на странице после отказавшей замены
+    refusing.put(key_of(photo), JPEG)
+    orphan = "uploads/ffffffff-ffff-4fff-8fff-ffffffffffff/original"  # по ключу идёт после фото
+    refusing.put(orphan, b"x")
+    old_enough(refusing, key_of(photo), orphan)
+
+    result = await housekeeping.sweep_orphan_objects(sessionmaker, refusing)
+
+    assert result.scrubbed == 0
+    assert orphan in refusing.deleted  # сирота убран, несмотря на отказ с оригиналом
+    assert refusing.objects[key_of(photo)][0] == JPEG  # оригинал ждёт следующей ночи
 
 
 async def test_the_sweep_is_capped_per_run_and_continues_next_time(
@@ -875,6 +928,7 @@ async def test_the_sweep_task_works_with_the_storage_of_the_worker_and_fails_lou
         "scanned": 1,
         "orphans_found": 1,
         "removed": 1,
+        "scrubbed": 0,
     }
 
     storage.unavailable = True

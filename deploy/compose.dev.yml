@@ -186,6 +186,9 @@ services:
   worker:
     <<: *backend
     command: ["python", "-m", "messunjerr", "worker", "--queue", "email", "--reload"]
+    environment:
+      <<: *backend-env
+      WORKER_METRICS_PORT: "9102"
     depends_on:
       redis:
         condition: service_healthy
@@ -203,6 +206,9 @@ services:
   worker-default:
     <<: *backend
     command: ["python", "-m", "messunjerr", "worker", "--queue", "default", "--reload"]
+    environment:
+      <<: *backend-env
+      WORKER_METRICS_PORT: "9102"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -219,6 +225,12 @@ services:
   worker-media:
     <<: *backend
     command: ["python", "-m", "messunjerr", "worker", "--queue", "media", "--reload"]
+    environment:
+      <<: *backend-env
+      # Метрики Prometheus воркера: http://localhost:9102/metrics (media_processing_seconds и другие).
+      WORKER_METRICS_PORT: "9102"
+    ports:
+      - "127.0.0.1:${WORKER_MEDIA_METRICS_PORT:-9102}:9102"
     depends_on:
       migrate:
         condition: service_completed_successfully

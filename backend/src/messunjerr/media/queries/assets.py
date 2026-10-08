@@ -1,18 +1,26 @@
-"""Чтение ресурсов для владельца: карточка и квота (5.8)."""
+"""Чтение ресурсов: карточка владельца, ссылки на файлы и квота (5.8)."""
 
 import uuid
+from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from messunjerr.media.domain.rules import Kind, Purpose, RejectReason, Status
 from messunjerr.media.infra.models import AssetRow
 from messunjerr.media.infra.repositories import AssetRepository
-from messunjerr.media.queries.models import Asset, AssetUrls, Quota
+from messunjerr.media.queries.models import Asset, AssetLinks, AssetUrls, Quota
 from messunjerr.settings import Settings
 
+if TYPE_CHECKING:
+    from messunjerr.media.domain.ports import AssetAudience
+    from messunjerr.media.queries.presenter import AssetPresenter
 
-def asset_dto(row: AssetRow) -> Asset:
-    """Карточка из строки. Ссылки (`urls`) пока всегда пусты: presigned GET появится в S6."""
+
+def asset_dto(
+    row: AssetRow, urls: AssetUrls | None = None, url_expires_at: datetime | None = None
+) -> Asset:
+    """Карточка из строки. Без `urls` ссылки пусты: их выдаёт `AssetPresenter` у готовых ресурсов."""
     return Asset(
         id=row.id,
         purpose=Purpose(row.purpose),
@@ -25,8 +33,8 @@ def asset_dto(row: AssetRow) -> Asset:
         width=row.width,
         height=row.height,
         reject_reason=RejectReason(row.reject_reason) if row.reject_reason else None,
-        urls=AssetUrls(),
-        url_expires_at=None,
+        urls=urls or AssetUrls(),
+        url_expires_at=url_expires_at,
         created_at=row.created_at,
         uploaded_at=row.uploaded_at,
         processed_at=row.processed_at,
@@ -34,11 +42,39 @@ def asset_dto(row: AssetRow) -> Asset:
 
 
 async def get_asset(
-    session: AsyncSession, *, asset_id: uuid.UUID, owner_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    asset_id: uuid.UUID,
+    owner_id: uuid.UUID,
+    presenter: "AssetPresenter",
 ) -> Asset | None:
-    """Карточка своего ресурса; чужой, несуществующий и удалённый одинаково `None` (4.6)."""
+    """Карточка своего ресурса со ссылками; чужой, несуществующий и удалённый одинаково `None` (4.6)."""
     row = await AssetRepository(session).get(asset_id, owner_id=owner_id)
-    return None if row is None else asset_dto(row)
+    return None if row is None else await presenter.card(row)
+
+
+async def get_asset_links(
+    session: AsyncSession,
+    *,
+    asset_id: uuid.UUID,
+    viewer_id: uuid.UUID,
+    presenter: "AssetPresenter",
+    audience: "AssetAudience",
+) -> AssetLinks | None:
+    """Свежие ссылки для владельца и для тех, кто вправе видеть объект, к которому ресурс привязан.
+
+    Остальным (чужой ресурс, несуществующий, удалённый) `None`: наружу это `404`, чтобы по ответу
+    нельзя было перебирать чужие идентификаторы.
+    """
+    row = await AssetRepository(session).get(asset_id)
+    if row is None:
+        return None
+    if row.owner_id != viewer_id and not await audience.can_view(
+        session, asset_id=row.id, viewer_id=viewer_id
+    ):
+        return None
+    links = await presenter.links(row)
+    return AssetLinks(urls=links.urls, url_expires_at=links.expires_at)
 
 
 async def get_quota(session: AsyncSession, *, owner_id: uuid.UUID, settings: Settings) -> Quota:

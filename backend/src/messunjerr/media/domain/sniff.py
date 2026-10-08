@@ -1,7 +1,9 @@
 """Определение типа файла по первым байтам (4.11): заявленному `content_type` и расширению не верим.
 
-Это заглушка обработки S5: она по сигнатуре решает, годится ли файл, и ничего не перекодирует.
-Настоящую обработку на Pillow (перекодирование, EXIF, варианты, лимит мегапикселей) делает S6.
+Первая, дешёвая проверка обработки: по сигнатуре решает, годится ли файл, и называет формат
+изображения, не читая файл целиком. SVG, HTML, исполняемые файлы и неподдерживаемые форматы
+отсекаются здесь; настоящий разбор (перекодирование, EXIF, варианты, лимит мегапикселей) делает
+Pillow в `media.infra.images`, и открывает файл только как тот формат, который назвала эта проверка.
 Чистые функции: на вход первые байты объекта (хватает 4 КиБ), на выходе вердикт.
 """
 
@@ -89,6 +91,8 @@ class Verdict:
     accepted: bool
     content_type: str | None = None
     """Тип по содержимому для принятого изображения; у файла `None` (остаётся заявленный)."""
+    image_format: ImageFormat | None = None
+    """Формат принятого изображения: в этом виде его откроет Pillow."""
     reject_reason: RejectReason | None = None
 
 
@@ -108,4 +112,4 @@ def judge(kind: Kind, purpose: Purpose, head: bytes) -> Verdict:
         return Verdict(accepted=False, reject_reason=reason)
     if purpose in AVATAR_PURPOSES and detected is ImageFormat.GIF:
         return Verdict(accepted=False, reject_reason=RejectReason.UNSUPPORTED_FORMAT)
-    return Verdict(accepted=True, content_type=IMAGE_MIME[detected])
+    return Verdict(accepted=True, content_type=IMAGE_MIME[detected], image_format=detected)

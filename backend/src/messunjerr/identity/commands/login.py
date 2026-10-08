@@ -12,6 +12,7 @@ from datetime import datetime
 from messunjerr.core.audit import record_audit
 from messunjerr.core.clock import utcnow
 from messunjerr.core.errors import DomainError
+from messunjerr.core.metrics import AUTH_FAILURES
 from messunjerr.core.ratelimit import RateLimiter, rate_limited
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.identity.commands.common import (
@@ -57,6 +58,7 @@ async def _fail(
     error: DomainError,
 ) -> DomainError:
     """Фиксирует запись аудита о неудачной попытке (отдельно от остального) и отдаёт ошибку."""
+    AUTH_FAILURES.labels(reason=reason).inc()
     record_audit(
         uow.session,
         action=audit.LOGIN_FAILURE,

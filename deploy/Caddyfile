@@ -149,13 +149,31 @@
 	# этого не ловит.
 	# Анонимно читаются только `public/` (аватары), это решает SeaweedFS; сюда же писать в `public/`
 	# через Caddy не нужно никому (файлы туда кладёт воркер по внутреннему адресу).
-	handle /media/* {
-		@public_write {
-			path /media/public/*
-			not method GET HEAD
-		}
+	# Публичные варианты аватаров (только чтение) неизменяемы: при смене аватара появляется новый
+	# asset_id и новый адрес. Год в кэше браузеров и прокси задаёт Caddy, а не метаданные объекта (воркер
+	# пишет их тоже, но верить хранилищу в заголовках ответа мы не обязаны), и только успешным ответам:
+	# `header` без условия ставил год и на 404, а такой ответ браузер вправе держать год. Ответы
+	# хранилища с кодом не из @good идут как есть (без Cache-Control).
+	handle /media/public/* {
+		@public_write not method GET HEAD
 		respond @public_write 405
 
+		reverse_proxy seaweedfs:8333 {
+			flush_interval -1
+			header_down -Server
+			header_down -X-Amz-Request-Id
+			header_down -Seaweed-X-Amz-Owner
+			header_down -Seaweed-X-Amz-Etag
+
+			@good status 2xx 304
+			handle_response @good {
+				header >Cache-Control "public, max-age=31536000, immutable"
+				copy_response
+			}
+		}
+	}
+
+	handle /media/* {
 		# SeaweedFS принимает неподписанные заголовки о содержимом и хранит их как метаданные объекта,
 		# а при чтении отдаёт (проверено: Content-Encoding, Content-Disposition, Cache-Control, Expires,
 		# Content-Language). Подпись ссылки закрепляет только Content-Type, Content-Length и

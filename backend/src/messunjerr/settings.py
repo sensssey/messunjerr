@@ -116,6 +116,15 @@ class Settings(BaseSettings):
         le=168,
         description="через сколько часов незавершённая загрузка удаляется вместе с объектом (4.11)",
     )
+    download_url_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+        description="сколько действует presigned GET на закрытые варианты и файлы (4.11: 10 минут)",
+    )
+
+    # --- метрики (S6-06): `/metrics` у API отдаёт сам API; у воркеров отдельный порт, 0 значит выключено
+    worker_metrics_port: int = Field(default=0, ge=0, le=65535)
 
     # --- HTTP
     request_body_limit_bytes: int = Field(default=1_048_576, ge=1024)
@@ -285,20 +294,27 @@ class Settings(BaseSettings):
 
 
 def check_runtime(
-    settings: Settings, *, needs_mail: bool = False, needs_storage: bool = False
+    settings: Settings,
+    *,
+    needs_mail: bool = False,
+    needs_storage: bool = False,
+    needs_jwt: bool = True,
 ) -> None:
     """Останавливает процесс при старте, если в prod или stage не хватает обязательных значений.
 
     Проверка не входит в валидацию модели: утилиты и тесты создают `Settings` частично.
     `needs_mail` включает проверку SMTP, она нужна воркеру, но не API; `needs_storage` проверяет
-    адрес и ключи S3, они нужны API и воркеру очереди `media`.
+    адрес и ключи S3, они нужны API и воркеру очереди `media`. `needs_jwt` (по умолчанию да) проверяет
+    ключ подписи токенов: он нужен только API, воркерам его не монтируют. Особенно воркеру `media`,
+    где разбираются недоверенные файлы: уязвимость кодека не должна давать способ выпускать токены
+    (спецификация 4.11).
     """
     if not settings.strict_runtime:
         return
     missing: list[str] = []
     if not settings.public_base_url:
         missing.append("PUBLIC_BASE_URL")
-    if settings.jwt_private_key is None:
+    if needs_jwt and settings.jwt_private_key is None:
         missing.append("JWT_PRIVATE_KEY (или JWT_PRIVATE_KEY_FILE)")
     if needs_mail and settings.smtp_url is None:
         missing.append("SMTP_URL (или SMTP_URL_FILE)")

@@ -1,4 +1,4 @@
-"""Порты профилей к контекстам выше: медиа (S5–S6), социальный граф (S7–S8), контент (S11).
+"""Порты профилей к контекстам выше: медиа (S6), социальный граф (S7–S8), контент (S11).
 
 `media`, `social` и `content` стоят выше `profiles` в графе 4.2 и импортировать их отсюда нельзя.
 Пока их нет, корень приложения подставляет заглушки из `profiles.infra.stubs`; каждый следующий
@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from messunjerr.core.uow import UnitOfWork
 from messunjerr.profiles.domain.policies import Relation
 
 Friendship = Literal["none", "friends", "request_sent", "request_received"]
@@ -32,7 +33,15 @@ class AvatarCheck(StrEnum):
 class AvatarAssets(Protocol):
     async def check(
         self, session: AsyncSession, *, owner_id: uuid.UUID, asset_id: uuid.UUID
-    ) -> AvatarCheck: ...
+    ) -> AvatarCheck:
+        """Можно ли назначить ресурс аватаром. Строка ресурса блокируется до конца транзакции:
+        параллельное удаление ресурса не успеет вклиниться между проверкой и назначением."""
+        ...
+
+    async def release(self, uow: UnitOfWork, *, owner_id: uuid.UUID, asset_id: uuid.UUID) -> None:
+        """Прежний аватар заменён или убран: ресурс больше не нужен и удаляется вместе с объектами
+        (в той же транзакции, объекты убирает фоновая задача после коммита)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

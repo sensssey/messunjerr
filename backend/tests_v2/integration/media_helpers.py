@@ -1,14 +1,22 @@
-"""Помощники интеграционных тестов медиа: заявка, «загрузка клиентом», завершение, чтение, удаление."""
+"""Помощники интеграционных тестов медиа: заявка, «загрузка клиентом», завершение, обработка, чтение.
 
+Картинки настоящие (их строит Pillow): обработка S6 открывает файл целиком, а не только сигнатуру.
+"""
+
+import io
 import uuid
 from collections.abc import Sequence
 from typing import Any
 
 import httpx
+from PIL import Image, ImageDraw
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from messunjerr.core.jobs import InMemoryJobQueue
+from messunjerr.media.commands.process_media import Outcome, ProcessMedia, process_media
 from messunjerr.media.domain.ports import StoredObject
+from messunjerr.media.infra.images import DecodeBudget
 from messunjerr.media.infra.memory import InMemoryObjectStorage
 
 from .helpers import SignedInUser
@@ -16,11 +24,44 @@ from .helpers import SignedInUser
 MEDIA = "/api/v1/media"
 UPLOADS = f"{MEDIA}/uploads"
 MIB = 1024 * 1024
+Sessions = async_sessionmaker[AsyncSession]
 
-# Первые байты настоящих файлов: хватает, чтобы заглушка обработки (сигнатуры) вынесла вердикт.
-JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 100
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 100
-GIF = b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 100
+RED, GREEN, BLUE, YELLOW = (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)
+
+
+def quadrants(size: tuple[int, int] = (48, 32)) -> Image.Image:
+    """Четыре цвета по четвертям: по ним видно поворот и обрезку."""
+    width, height = size
+    image = Image.new("RGB", size, (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width // 2 - 1, height // 2 - 1), fill=RED)
+    draw.rectangle((width // 2, 0, width - 1, height // 2 - 1), fill=GREEN)
+    draw.rectangle((0, height // 2, width // 2 - 1, height - 1), fill=BLUE)
+    draw.rectangle((width // 2, height // 2, width - 1, height - 1), fill=YELLOW)
+    return image
+
+
+def encode(image: Image.Image, fmt: str, **options: Any) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format=fmt, **options)
+    return buffer.getvalue()
+
+
+def gps_exif(orientation: int = 1) -> Image.Exif:
+    """EXIF с моделью устройства и геометкой: по ним видно, что обработка их убрала."""
+    exif = Image.Exif()
+    exif[0x010F] = "SecretMaker"
+    exif[0x0110] = "SecretModel"
+    exif[0x0112] = orientation
+    exif[0x8825] = {1: "N", 2: (55.0, 45.0, 21.0), 3: "E", 4: (37.0, 37.0, 4.0)}
+    return exif
+
+
+# Маленькие настоящие файлы: проходят и проверку сигнатуры, и разбор Pillow.
+JPEG = encode(quadrants(), "JPEG", quality=85)
+PNG = encode(quadrants(), "PNG")
+GIF = encode(quadrants(), "GIF")
+WEBP = encode(quadrants(), "WEBP", quality=80)
 SVG = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'
 PDF = b"%PDF-1.7\n" + b"x" * 100
 EXE = (
@@ -31,6 +72,17 @@ EXE = (
     + b"PE\x00\x00"
     + b"\x00" * 32
 )
+CONTENT_TYPES = {
+    b"\xff\xd8": "image/jpeg",
+    b"\x89P": "image/png",
+    b"GI": "image/gif",
+    b"RI": "image/webp",
+}
+
+
+def content_type_of(body: bytes) -> str:
+    """Заявленный тип по первым байтам тестового файла (для обычных картинок)."""
+    return CONTENT_TYPES.get(body[:2], "application/octet-stream")
 
 
 def body_of(**overrides: Any) -> dict[str, Any]:
@@ -84,6 +136,12 @@ async def read_asset(
     return await client.get(f"{MEDIA}/{asset_id}", headers=user.headers)
 
 
+async def read_urls(
+    client: httpx.AsyncClient, user: SignedInUser, asset_id: str | uuid.UUID
+) -> httpx.Response:
+    return await client.get(f"{MEDIA}/{asset_id}/urls", headers=user.headers)
+
+
 async def uploaded(
     client: httpx.AsyncClient,
     user: SignedInUser,
@@ -98,6 +156,42 @@ async def uploaded(
     response = await complete(client, user, created["asset"]["id"])
     assert response.status_code == 202, response.text
     return created
+
+
+async def process(
+    asset_id: str | uuid.UUID,
+    sessions: Sessions,
+    storage: InMemoryObjectStorage,
+    jobs: InMemoryJobQueue,
+    *,
+    budget: DecodeBudget | None = None,
+) -> Outcome:
+    """Воркер media берёт задачу `process_media` для ресурса."""
+    return await process_media(
+        ProcessMedia(uuid.UUID(str(asset_id))),
+        sessionmaker=sessions,
+        storage=storage,
+        jobs=jobs,
+        budget=budget,
+    )
+
+
+async def ready(
+    client: httpx.AsyncClient,
+    user: SignedInUser,
+    storage: InMemoryObjectStorage,
+    jobs: InMemoryJobQueue,
+    sessions: Sessions,
+    body: bytes = JPEG,
+    **overrides: Any,
+) -> str:
+    """Загрузка, завершение и обработка: ресурс `ready`. Возвращает его идентификатор."""
+    overrides.setdefault("content_type", content_type_of(body))
+    created = await uploaded(client, user, storage, body, **overrides)
+    asset_id = str(created["asset"]["id"])
+    outcome = await process(asset_id, sessions, storage, jobs)
+    assert outcome is Outcome.READY, outcome
+    return asset_id
 
 
 class ProbingStorage(InMemoryObjectStorage):

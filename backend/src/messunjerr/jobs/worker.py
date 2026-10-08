@@ -33,7 +33,9 @@ from messunjerr.core.jobs import (
 )
 from messunjerr.core.logs import configure_logging, get_logger
 from messunjerr.core.mail import SmtpMailer, parse_smtp_url
+from messunjerr.core.metrics import Exporter, start_exporter
 from messunjerr.jobs.health import queue_key
+from messunjerr.jobs.instrument import instrumented
 from messunjerr.jobs.queue import ArqJobQueue, json_deserializer, json_serializer, redis_settings
 from messunjerr.jobs.tasks import (
     DELETE_MEDIA_OBJECTS_MAX_TRIES,
@@ -50,11 +52,16 @@ from messunjerr.jobs.tasks import (
     send_email,
     sweep_orphan_objects,
 )
+from messunjerr.media.infra.images import DecodeBudget
 from messunjerr.media.services import build_storage
 from messunjerr.settings import Settings, check_runtime, get_settings
 
 HEALTH_CHECK_INTERVAL_SECONDS = 30
 CLEANUP_TIMEOUT_SECONDS = 600
+DEFAULT_MAX_JOBS = 10
+"""Значение arq по умолчанию: у почты и плановых задач ограничений нет."""
+MEDIA_MAX_JOBS = 2
+"""Обработка изображений грузит процессор и память: очередь `media` берёт две задачи разом (4.12)."""
 
 
 def functions_for(queue: str) -> list[Function]:
@@ -62,7 +69,7 @@ def functions_for(queue: str) -> list[Function]:
     registry: dict[str, list[Function]] = {
         QUEUE_EMAIL: [
             func(
-                send_email,
+                instrumented(TASK_SEND_EMAIL, send_email),
                 name=TASK_SEND_EMAIL,
                 max_tries=SEND_EMAIL_MAX_TRIES,
                 keep_result=0,
@@ -73,14 +80,14 @@ def functions_for(queue: str) -> list[Function]:
         QUEUE_MEDIA: [
             # Результат не сохраняется: повторная постановка той же задачи после итога должна проходить.
             func(
-                process_media,
+                instrumented(TASK_PROCESS_MEDIA, process_media),
                 name=TASK_PROCESS_MEDIA,
                 max_tries=PROCESS_MEDIA_MAX_TRIES,
                 keep_result=0,
                 timeout=PROCESS_MEDIA_TIMEOUT_SECONDS,
             ),
             func(
-                delete_media_objects,
+                instrumented(TASK_DELETE_MEDIA_OBJECTS, delete_media_objects),
                 name=TASK_DELETE_MEDIA_OBJECTS,
                 max_tries=DELETE_MEDIA_OBJECTS_MAX_TRIES,
                 keep_result=0,
@@ -100,7 +107,7 @@ def cron_jobs_for(queue: str) -> list[CronJob]:
         QUEUE_DEFAULT: [
             # Раз в сутки ночью: аккаунты без подтверждённой почты занимают ник и адрес.
             cron(
-                cleanup_unverified_accounts,
+                instrumented(TASK_CLEANUP_UNVERIFIED_ACCOUNTS, cleanup_unverified_accounts),
                 name=TASK_CLEANUP_UNVERIFIED_ACCOUNTS,
                 hour=3,
                 minute=10,
@@ -108,21 +115,21 @@ def cron_jobs_for(queue: str) -> list[CronJob]:
             ),
             # Раз в час: токены писем и записи идемпотентности быстро теряют смысл.
             cron(
-                cleanup_tokens_and_idempotency,
+                instrumented(TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY, cleanup_tokens_and_idempotency),
                 name=TASK_CLEANUP_TOKENS_AND_IDEMPOTENCY,
                 minute=17,
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             ),
             # Раз в час: загрузки, которые так и не завершили, занимают квоту и место в хранилище.
             cron(
-                cleanup_pending_uploads,
+                instrumented(TASK_CLEANUP_PENDING_UPLOADS, cleanup_pending_uploads),
                 name=TASK_CLEANUP_PENDING_UPLOADS,
                 minute=41,
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             ),
             # Каждые 5 минут: подбирает потерянные постановки обработки и удаления (до Kafka, S5-06).
             cron(
-                reconcile_uploads,
+                instrumented(TASK_RECONCILE_UPLOADS, reconcile_uploads),
                 name=TASK_RECONCILE_UPLOADS,
                 minute=set(range(0, 60, 5)),
                 timeout=CLEANUP_TIMEOUT_SECONDS,
@@ -130,7 +137,7 @@ def cron_jobs_for(queue: str) -> list[CronJob]:
             # Раз в сутки: объекты без живого ресурса (медленная загрузка дописалась после очистки,
             # удаление аккаунта убрало строки каскадом) уходят из хранилища.
             cron(
-                sweep_orphan_objects,
+                instrumented(TASK_SWEEP_ORPHAN_OBJECTS, sweep_orphan_objects),
                 name=TASK_SWEEP_ORPHAN_OBJECTS,
                 hour=4,
                 minute=20,
@@ -148,7 +155,7 @@ async def _on_startup(ctx: dict[str, Any]) -> None:
     configure_logging(settings.log_level, settings.log_format)
     ctx["settings"] = settings
     if queue == QUEUE_EMAIL:
-        check_runtime(settings, needs_mail=True)
+        check_runtime(settings, needs_mail=True, needs_jwt=False)
         if settings.smtp_url is None:
             raise RuntimeError("Для воркера почты нужен SMTP_URL (или SMTP_URL_FILE)")
         ctx["mailer"] = SmtpMailer(parse_smtp_url(settings.smtp_url.get_secret_value()))
@@ -156,7 +163,7 @@ async def _on_startup(ctx: dict[str, Any]) -> None:
         # Хранилище нужно очереди media (обработка, удаление объектов) и плановым задачам default
         # (суточная сверка объектов с таблицей).
         needs_storage = queue in (QUEUE_MEDIA, QUEUE_DEFAULT)
-        check_runtime(settings, needs_storage=needs_storage)
+        check_runtime(settings, needs_storage=needs_storage, needs_jwt=False)
         engine = create_engine(settings)
         ctx["engine"] = engine
         ctx["sessionmaker"] = create_sessionmaker(engine)
@@ -165,10 +172,22 @@ async def _on_startup(ctx: dict[str, Any]) -> None:
             storage = build_storage(settings)
             await storage.warm_up()
             ctx["storage"] = storage
-    get_logger("messunjerr.jobs").info("worker_started", queue=queue)
+        if queue == QUEUE_MEDIA:
+            ctx["decode_budget"] = DecodeBudget()
+    log = get_logger("messunjerr.jobs")
+    try:
+        ctx["exporter"] = start_exporter(settings.worker_metrics_port)
+    except OSError as error:
+        # Метрики вспомогательные: занятый порт не повод не запускать воркер (письма и файлы ждут).
+        ctx["exporter"] = None
+        log.warning("metrics_exporter_failed", port=settings.worker_metrics_port, error=str(error))
+    log.info("worker_started", queue=queue)
 
 
 async def _on_shutdown(ctx: dict[str, Any]) -> None:
+    exporter: Exporter | None = ctx.get("exporter")
+    if exporter is not None:
+        exporter.stop()
     storage = ctx.get("storage")
     if storage is not None:
         await storage.close()
@@ -199,6 +218,7 @@ def build_worker(
         job_serializer=json_serializer,
         job_deserializer=json_deserializer,
         health_check_interval=HEALTH_CHECK_INTERVAL_SECONDS,
+        max_jobs=MEDIA_MAX_JOBS if queue == QUEUE_MEDIA else DEFAULT_MAX_JOBS,
         burst=burst,
         handle_signals=handle_signals,
         timezone=UTC,

@@ -192,6 +192,7 @@ async def test_public_avatar_is_readable_anonymously_with_cache_headers(
     ranged = await client.get(public_url(stand, key), headers={"Range": "bytes=0-2"})
     assert ranged.status_code == 206
     assert ranged.content == b"ava"
+    assert ranged.headers["cache-control"] == "public, max-age=31536000, immutable"
 
 
 async def test_internal_headers_of_seaweedfs_are_not_exposed(
@@ -212,7 +213,10 @@ async def test_nobody_writes_to_the_public_prefix_through_the_edge(
     signed_put = sign(stand, "PUT", public_url(stand, key), signed_headers=WEBP)
     assert (await client.put(signed_put, content=b"evil", headers=WEBP)).status_code == 405
     assert (await client.delete(public_url(stand, key))).status_code == 405
-    assert (await client.get(public_url(stand, key))).status_code == 404  # объекта так и нет
+    missing = await client.get(public_url(stand, key))
+    assert missing.status_code == 404  # объекта так и нет
+    # Год в кэше ставится только успешным ответам: ошибку браузер не должен запомнить на год.
+    assert "cache-control" not in missing.headers
 
 
 async def test_public_prefix_listing_reveals_no_keys(

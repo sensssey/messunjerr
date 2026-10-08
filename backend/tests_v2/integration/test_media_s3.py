@@ -7,6 +7,7 @@ SeaweedFS поднимается отдельным шагом); без них �
 """
 
 import asyncio
+import io
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -17,6 +18,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
+from PIL import Image
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -25,13 +27,29 @@ from messunjerr.core.jobs import InMemoryJobQueue
 from messunjerr.main import create_app
 from messunjerr.media.commands import housekeeping
 from messunjerr.media.commands.process_media import Outcome, ProcessMedia, process_media
-from messunjerr.media.domain.ports import ObjectStorage, PresignedUpload, StorageUnavailableError
+from messunjerr.media.domain.ports import (
+    ObjectStorage,
+    ObjectTooLargeError,
+    PresignedUpload,
+    StorageUnavailableError,
+)
+from messunjerr.media.domain.rules import PUBLIC_CACHE_CONTROL
 from messunjerr.media.infra.s3 import S3ObjectStorage
 from messunjerr.media.services import build_storage
 from messunjerr.settings import Settings
 
 from .helpers import fetch_one, verified_user
-from .media_helpers import JPEG, MEDIA, complete, read_asset, started
+from .media_helpers import (
+    JPEG,
+    MEDIA,
+    PDF,
+    complete,
+    encode,
+    gps_exif,
+    quadrants,
+    read_asset,
+    started,
+)
 
 Sessions = async_sessionmaker[AsyncSession]
 
@@ -248,6 +266,102 @@ async def test_wrong_keys_are_reported_as_unavailable(s3_settings: Settings) -> 
         await wrong.close()
 
 
+# ----------------------------------------------------------------------------- чтение, запись, ссылки на чтение
+async def test_objects_are_written_read_back_and_bounded(s3: ObjectStorage) -> None:
+    key = fresh_key()
+    body = b"w" * 5000
+    try:
+        await s3.write_object(
+            key, body, content_type="image/webp", cache_control="private, max-age=60"
+        )
+
+        stored = await s3.head(key)
+        assert stored is not None
+        assert (stored.size, stored.content_type) == (5000, "image/webp")
+        assert await s3.read_object(key, 5000) == body
+        with pytest.raises(ObjectTooLargeError):
+            await s3.read_object(key, 4999)
+        assert await s3.read_object(fresh_key(), 100) is None
+        await s3.write_object(key, b"", content_type="application/octet-stream")  # поверх, пустой
+        assert (await s3.head(key) or pytest.fail("нет объекта")).size == 0
+        # Диапазон у пустого объекта хранилище отвечает 416: это пустой объект, а не сбой хранилища.
+        assert await s3.read_head(key, 4096) == b""
+        assert await s3.read_object(key, 100) == b""
+    finally:
+        await s3.delete_many([key])
+
+
+async def test_a_presigned_get_sets_the_response_headers_itself(s3: ObjectStorage) -> None:
+    key = fresh_key()
+    try:
+        # Объект хранится «как попало»: тип text/html, внутри разметка. Скачивающий этого видеть не должен.
+        await s3.write_object(key, b"<script>alert(1)</script>", content_type="text/html")
+        link = await s3.presign_get(
+            key=key,
+            expires_in=120,
+            content_type="application/octet-stream",
+            content_disposition='attachment; filename="a.txt"',
+            cache_control="private, max-age=300",
+        )
+        async with httpx.AsyncClient(timeout=15) as http:
+            response = await http.get(link)
+            plain = await http.get(await s3.presign_get(key=key, expires_in=120))
+
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["content-disposition"] == 'attachment; filename="a.txt"'
+        assert response.headers["cache-control"] == "private, max-age=300"
+        assert plain.headers["content-type"] == "text/html"  # то, чему верить нельзя
+    finally:
+        await s3.delete_many([key])
+
+
+async def test_an_expired_or_forged_get_link_does_not_open_the_object(
+    s3: ObjectStorage, s3_settings: Settings
+) -> None:
+    key = fresh_key()
+    try:
+        await s3.write_object(key, b"secret", content_type="application/octet-stream")
+        link = await s3.presign_get(key=key, expires_in=120)
+        async with httpx.AsyncClient(timeout=15) as http:
+            anonymous = await http.get(
+                f"{s3_settings.storage_public_url}/{s3_settings.s3_bucket}/{key}"
+            )
+            tampered = await http.get(link.replace("/uploads/", "/uploads/x"))
+        assert anonymous.status_code == 403  # без подписи закрытый префикс не читается
+        assert tampered.status_code in (403, 404)
+    finally:
+        await s3.delete_many([key])
+
+
+async def test_only_the_public_prefix_is_readable_without_a_signature(
+    s3: ObjectStorage, s3_settings: Settings
+) -> None:
+    name = uuid.uuid4()
+    public = f"public/avatars/{name}/64.webp"
+    private = f"uploads/{name}/thumb.webp"
+    base = f"{s3_settings.storage_public_url}/{s3_settings.s3_bucket}"
+    try:
+        for key in (public, private):
+            await s3.write_object(
+                key,
+                b"RIFFxxxxWEBPfake",
+                content_type="image/webp",
+                cache_control=PUBLIC_CACHE_CONTROL,
+            )
+        async with httpx.AsyncClient(timeout=15) as http:
+            opened = await http.get(f"{base}/{public}")
+            closed = await http.get(f"{base}/{private}")
+            forged = await http.put(f"{base}/public/avatars/{name}/evil.webp", content=b"x")
+            listing = await http.get(f"{base}?list-type=2&prefix=public/")
+        assert opened.status_code == 200
+        assert opened.headers["content-type"] == "image/webp"
+        assert opened.headers["cache-control"] == PUBLIC_CACHE_CONTROL
+        assert (closed.status_code, forged.status_code, listing.status_code) == (403, 403, 403)
+    finally:
+        await s3.delete_many([public, private])
+
+
 # ----------------------------------------------------------------------------- вся цепочка через API
 async def test_the_whole_chain_with_the_real_storage(
     client: httpx.AsyncClient,
@@ -256,6 +370,7 @@ async def test_the_whole_chain_with_the_real_storage(
     sessionmaker: Sessions,
     admin_engine: AsyncEngine,
 ) -> None:
+    """Фото с геометкой: загрузка по ссылке, обработка, ссылки на варианты, удаление."""
     user = await verified_user(client, jobs)
     storage = build_storage(s3_settings)
     application = create_app(s3_settings, job_queue=jobs, storage=storage)
@@ -263,14 +378,13 @@ async def test_the_whole_chain_with_the_real_storage(
         async with LifespanManager(application):
             transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
-                body = JPEG + b"\x07" * 3000
+                body = encode(quadrants((800, 600)), "JPEG", exif=gps_exif(), quality=90)
                 created = await started(api, user, size_bytes=len(body))
                 upload = created["upload"]
                 asset_id = created["asset"]["id"]
 
                 put_response = await put(upload["url"], body, upload["headers"])
                 assert put_response.status_code == 200, put_response.text
-
                 done = await complete(api, user, asset_id)
                 assert done.status_code == 202, done.text
                 assert done.json()["asset"]["status"] == "uploaded"
@@ -283,23 +397,160 @@ async def test_the_whole_chain_with_the_real_storage(
                 )
                 assert outcome is Outcome.READY
                 ready = (await read_asset(api, user, asset_id)).json()
-                assert (ready["status"], ready["content_type"]) == ("ready", "image/jpeg")
+                assert (ready["status"], ready["content_type"]) == ("ready", "image/webp")
+                assert (ready["width"], ready["height"]) == (800, 600)
 
+                # Ссылки открывают варианты, и в них нет метаданных.
+                async with httpx.AsyncClient(timeout=15) as http:
+                    thumb = await http.get(ready["urls"]["thumb"])
+                    medium = await http.get(ready["urls"]["medium"])
+                for variant in (thumb, medium):
+                    assert variant.status_code == 200, variant.text
+                    assert variant.headers["content-type"] == "image/webp"
+                    assert b"Secret" not in variant.content
+                    assert b"Exif" not in variant.content
+                assert Image.open(io.BytesIO(medium.content)).size == (800, 600)
+
+                # Оригинал с геометкой заменён пустым объектом, а ключ остался занятым.
                 key = f"uploads/{asset_id}/original"
-                assert (await storage.head(key)) is not None
+                stored = await storage.head(key)
+                assert stored is not None
+                assert stored.size == 0
+                again = await put(upload["url"], body, upload["headers"])
+                assert again.status_code == 412  # запись один раз: подменить оригинал нельзя
+                assert (await storage.head(key) or pytest.fail("нет объекта")).size == 0
+
                 deleted = await api.delete(f"{MEDIA}/{asset_id}", headers=user.headers)
                 assert deleted.status_code == 204
                 removed = await housekeeping.delete_media_objects(
                     sessionmaker, storage, [uuid.UUID(asset_id)], link_lifetime=timedelta(0)
                 )
                 assert removed == 1
-                assert await storage.head(key) is None
+                for suffix in ("original", "thumb.webp", "medium.webp"):
+                    assert await storage.head(f"uploads/{asset_id}/{suffix}") is None
                 row: dict[str, Any] = await fetch_one(
                     admin_engine,
                     "SELECT objects_deleted_at FROM media.assets WHERE id = :id",
                     id=uuid.UUID(asset_id),
                 )
                 assert row["objects_deleted_at"] is not None
+    finally:
+        await storage.close()
+
+
+async def test_the_avatar_chain_with_the_real_storage(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    s3_settings: Settings,
+    sessionmaker: Sessions,
+) -> None:
+    """Аватар: публичные адреса открываются без подписи, замена убирает прежние файлы."""
+    user = await verified_user(client, jobs)
+    storage = build_storage(s3_settings)
+    application = create_app(s3_settings, job_queue=jobs, storage=storage)
+    try:
+        async with LifespanManager(application):
+            transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+                ids: list[str] = []
+                for _ in range(2):
+                    body = encode(quadrants((500, 300)), "JPEG", exif=gps_exif(), quality=90)
+                    created = await started(
+                        api, user, purpose="avatar", size_bytes=len(body), filename="me.jpg"
+                    )
+                    upload = created["upload"]
+                    assert (await put(upload["url"], body, upload["headers"])).status_code == 200
+                    assert (await complete(api, user, created["asset"]["id"])).status_code == 202
+                    outcome = await process_media(
+                        ProcessMedia(uuid.UUID(created["asset"]["id"])),
+                        sessionmaker=sessionmaker,
+                        storage=storage,
+                        jobs=jobs,
+                    )
+                    assert outcome is Outcome.READY
+                    ids.append(created["asset"]["id"])
+                first, second = ids
+
+                card = (await read_asset(api, user, first)).json()
+                async with httpx.AsyncClient(timeout=15) as http:
+                    small = await http.get(card["urls"]["thumb"])  # без подписи
+                    large = await http.get(card["urls"]["medium"])
+                assert (small.status_code, large.status_code) == (200, 200)
+                assert small.headers["cache-control"] == PUBLIC_CACHE_CONTROL
+                assert Image.open(io.BytesIO(small.content)).size == (64, 64)
+                assert Image.open(io.BytesIO(large.content)).size == (256, 256)
+                assert b"Secret" not in large.content
+
+                profile = "/api/v1/me/profile"
+                assert (
+                    await api.patch(profile, json={"avatar_asset_id": first}, headers=user.headers)
+                ).status_code == 200
+                replaced = await api.patch(
+                    profile, json={"avatar_asset_id": second}, headers=user.headers
+                )
+                assert replaced.status_code == 200
+                assert replaced.json()["avatar"]["md"].endswith(
+                    f"/public/avatars/{second}/256.webp"
+                )
+
+                removed = await housekeeping.delete_media_objects(
+                    sessionmaker, storage, [uuid.UUID(first)], link_lifetime=timedelta(0)
+                )
+                assert removed == 1
+                async with httpx.AsyncClient(timeout=15) as http:
+                    assert (
+                        await http.get(card["urls"]["thumb"])
+                    ).status_code == 404  # прежний убран
+                    fresh = (await read_asset(api, user, second)).json()
+                    assert (await http.get(fresh["urls"]["thumb"])).status_code == 200
+    finally:
+        await storage.close()
+
+
+async def test_a_file_is_downloaded_as_an_attachment_whatever_it_claimed_to_be(
+    client: httpx.AsyncClient,
+    jobs: InMemoryJobQueue,
+    s3_settings: Settings,
+    sessionmaker: Sessions,
+) -> None:
+    user = await verified_user(client, jobs)
+    storage = build_storage(s3_settings)
+    application = create_app(s3_settings, job_queue=jobs, storage=storage)
+    try:
+        async with LifespanManager(application):
+            transport = httpx.ASGITransport(app=application, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+                page = b"<html><script>alert(1)</script></html>" + PDF
+                created = await started(
+                    api,
+                    user,
+                    purpose="message",
+                    filename="страница.html",
+                    content_type="text/html",
+                    size_bytes=len(page),
+                )
+                upload = created["upload"]
+                assert upload["headers"]["Content-Type"] == "application/octet-stream"
+                assert (await put(upload["url"], page, upload["headers"])).status_code == 200
+                assert (await complete(api, user, created["asset"]["id"])).status_code == 202
+                outcome = await process_media(
+                    ProcessMedia(uuid.UUID(created["asset"]["id"])),
+                    sessionmaker=sessionmaker,
+                    storage=storage,
+                    jobs=jobs,
+                )
+                assert outcome is Outcome.READY
+
+                card = (await read_asset(api, user, created["asset"]["id"])).json()
+                async with httpx.AsyncClient(timeout=15) as http:
+                    download = await http.get(card["urls"]["original"])
+                assert download.status_code == 200
+                assert download.content == page
+                assert download.headers["content-type"] == "application/octet-stream"
+                disposition = download.headers["content-disposition"]
+                assert disposition.startswith('attachment; filename="')
+                assert "filename*=UTF-8''" in disposition
+                assert "%D1%81%D1%82%D1%80%D0%B0%D0%BD%D0%B8%D1%86%D0%B0.html" in disposition
     finally:
         await storage.close()
 

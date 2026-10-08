@@ -22,6 +22,7 @@ from redis.exceptions import RedisError
 from messunjerr.core.codes import ErrorCode
 from messunjerr.core.errors import DomainError
 from messunjerr.core.logs import get_logger
+from messunjerr.core.metrics import RATE_LIMITED
 
 UnavailablePolicy = Literal["allow", "deny"]
 
@@ -233,6 +234,7 @@ class RateLimiter:
 def rate_limited(result: RateLimitResult) -> DomainError:
     """`429 rate_limited`: `Retry-After`, `RateLimit-*` и поле `retry_after` в теле (5.1)."""
     retry_after = max(1, result.retry_after)
+    RATE_LIMITED.labels(bucket=result.bucket).inc()
     return DomainError(
         ErrorCode.RATE_LIMITED,
         headers={**result.headers(), "Retry-After": str(retry_after)},

@@ -2,7 +2,6 @@
 
 import asyncio
 import os
-from importlib import import_module
 from logging.config import fileConfig
 from pathlib import Path
 
@@ -12,15 +11,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from messunjerr.core.db import SCHEMAS, Base
+from messunjerr.tables import register_tables
 
-# Модули с моделями регистрируют таблицы в Base.metadata; каждый новый контекст добавляется сюда.
-for module in (
-    "messunjerr.core.models",
-    "messunjerr.identity.infra.models",
-    "messunjerr.profiles.infra.models",
-    "messunjerr.media.infra.models",
-):
-    import_module(module)
+# Модули с моделями регистрируют таблицы в Base.metadata; список ведёт messunjerr/tables.py.
+register_tables()
 
 config = context.config
 if config.config_file_name is not None:

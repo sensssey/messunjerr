@@ -1,4 +1,4 @@
-"""Модели ответов media (5.8): карточка ресурса и квота."""
+"""Модели ответов media (5.8, 5.1): карточка ресурса, вложение `MediaRef`, ссылки на файлы и квота."""
 
 import uuid
 
@@ -9,7 +9,12 @@ from messunjerr.media.domain.rules import Kind, Purpose, RejectReason, Status
 
 
 class AssetUrls(BaseModel):
-    """Ссылки на файл и его варианты. Пока ресурс не `ready`, все равны `null`; ссылки выдаёт S6."""
+    """Ссылки на файл и его варианты; пока ресурс не `ready`, все равны `null`.
+
+    У изображения `thumb` и `medium` (аватар 64 и 256 пикселей, фото 320 и 1280); `original` только у
+    GIF. У файла только `original`. Ссылки на аватар публичны и постоянны, остальные это presigned GET
+    на десять минут (`url_expires_at`).
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -81,6 +86,72 @@ class Asset(BaseModel):
     created_at: UtcDateTime
     uploaded_at: UtcDateTime | None
     processed_at: UtcDateTime | None
+
+
+class MediaRef(BaseModel):
+    """Вложение поста или сообщения (5.1): компактная карточка ресурса без служебных полей.
+
+    Контексты выше (посты S11, сообщения S14) собирают её через `AssetPresenter.ref`, чтобы каждый
+    ответ с вложениями нёс свежие ссылки; сам ресурс по-прежнему принадлежит media.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": "0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80",
+                    "kind": "image",
+                    "status": "ready",
+                    "content_type": "image/webp",
+                    "size_bytes": 184233,
+                    "filename": "photo.jpg",
+                    "width": 1280,
+                    "height": 960,
+                    "urls": {
+                        "thumb": "https://messunjerr.localhost/media/uploads/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80/thumb.webp?X-Amz-Signature=0f3a",
+                        "medium": "https://messunjerr.localhost/media/uploads/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80/medium.webp?X-Amz-Signature=91b2",
+                        "original": None,
+                    },
+                    "url_expires_at": "2026-10-04T12:44:56.000Z",
+                }
+            ]
+        },
+    )
+
+    id: uuid.UUID
+    kind: Kind
+    status: Status
+    content_type: str | None
+    size_bytes: int | None
+    filename: str | None
+    width: int | None
+    height: int | None
+    urls: AssetUrls
+    url_expires_at: UtcDateTime | None
+
+
+class AssetLinks(BaseModel):
+    """Свежие ссылки на файлы ресурса (`GET /media/{asset_id}/urls`)."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "urls": {
+                        "thumb": "https://messunjerr.localhost/media/uploads/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80/thumb.webp?X-Amz-Signature=0f3a",
+                        "medium": "https://messunjerr.localhost/media/uploads/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80/medium.webp?X-Amz-Signature=91b2",
+                        "original": None,
+                    },
+                    "url_expires_at": "2026-10-07T12:45:56.789Z",
+                }
+            ]
+        },
+    )
+
+    urls: AssetUrls
+    url_expires_at: UtcDateTime | None
 
 
 class Quota(BaseModel):

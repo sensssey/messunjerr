@@ -26,7 +26,8 @@ from messunjerr.identity.api.routers import well_known_router
 from messunjerr.identity.services import create_identity_services
 from messunjerr.jobs.queue import ArqJobQueue
 from messunjerr.media.api.routers import api_router as media_api_router
-from messunjerr.media.domain.ports import ObjectStorage
+from messunjerr.media.commands.avatars import MediaAvatarAssets
+from messunjerr.media.domain.ports import AssetAudience, ObjectStorage
 from messunjerr.media.infra.usage import CompositeAssetUsage
 from messunjerr.media.services import create_media_services
 from messunjerr.profiles.api.routers import api_router as profiles_api_router
@@ -59,8 +60,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     injected: JobQueue | None = app.state.job_queue
     arq_queue = ArqJobQueue(settings.redis_url.get_secret_value()) if injected is None else None
     jobs: JobQueue = injected if injected is not None else cast(ArqJobQueue, arq_queue)
-    # Порты профилей к медиа, графу и контенту пока заглушки: настоящие подставят S6, S7–S8, S11.
-    profiles = create_profile_services()
+    # Порты профилей: аватары реализует медиа, граф и контент пока заглушки (S7–S8, S11).
+    profiles = create_profile_services(avatars=MediaAvatarAssets(jobs))
     # identity ниже profiles в графе контекстов (4.2): создание профиля при регистрации и разделы
     # `MeUser` ему приносят порты, которые реализуют профили.
     identity = await create_identity_services(
@@ -72,6 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         settings,
         storage=app.state.storage,
         usage=CompositeAssetUsage([ProfileAvatarUsage()]),
+        audience=app.state.asset_audience,
     )
     await media.storage.warm_up()
     app.state.identity = identity
@@ -108,8 +110,10 @@ def create_app(
     rate_limits: Mapping[str, BucketConfig] | None = None,
     shutdown_gate: ShutdownGate | None = None,
     storage: ObjectStorage | None = None,
+    asset_audience: AssetAudience | None = None,
 ) -> FastAPI:
-    """Собирает приложение. `job_queue`, `rate_limits`, `shutdown_gate` и `storage` подставляют тесты.
+    """Собирает приложение. `job_queue`, `rate_limits`, `shutdown_gate`, `storage` и `asset_audience`
+    подставляют тесты.
 
     Иначе работают arq, ratelimits.toml, калитка процесса, которую закрывает `GracefulServer`, и
     клиент S3 по настройкам `S3_*` (без них ручки загрузки отвечают 503).
@@ -138,6 +142,7 @@ def create_app(
     app.state.rate_limits = buckets
     app.state.shutdown = shutdown_gate or get_shutdown_gate()
     app.state.storage = storage
+    app.state.asset_audience = asset_audience
 
     install_problem_handlers(app)
     # Порядок: последний добавленный стоит снаружи, поэтому контекст запроса оборачивает защиту.

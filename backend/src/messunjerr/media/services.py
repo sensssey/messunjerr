@@ -1,11 +1,12 @@
-"""Службы контекста media, создаваемые один раз при старте процесса: хранилище и привязки ресурсов."""
+"""Службы контекста media, создаваемые один раз при старте процесса: хранилище, привязки и выдача ссылок."""
 
 from dataclasses import dataclass
 
-from messunjerr.media.domain.ports import AssetUsage, ObjectStorage
+from messunjerr.media.domain.ports import AssetAudience, AssetUsage, ObjectStorage
 from messunjerr.media.infra.memory import UnconfiguredStorage
 from messunjerr.media.infra.s3 import S3ObjectStorage
-from messunjerr.media.infra.usage import CompositeAssetUsage
+from messunjerr.media.infra.usage import CompositeAssetAudience, CompositeAssetUsage
+from messunjerr.media.queries.presenter import AssetPresenter
 from messunjerr.settings import Settings
 
 
@@ -31,16 +32,25 @@ def build_storage(settings: Settings) -> ObjectStorage:
 class MediaServices:
     storage: ObjectStorage
     usage: AssetUsage
+    audience: AssetAudience
+    presenter: AssetPresenter
 
     async def close(self) -> None:
         await self.storage.close()
 
 
 def create_media_services(
-    settings: Settings, *, storage: ObjectStorage | None = None, usage: AssetUsage | None = None
+    settings: Settings,
+    *,
+    storage: ObjectStorage | None = None,
+    usage: AssetUsage | None = None,
+    audience: AssetAudience | None = None,
 ) -> MediaServices:
-    """`storage` подставляют тесты; `usage` собирает корень приложения из привязок контекстов."""
+    """`storage` подставляют тесты; `usage` и `audience` собирает корень приложения из привязок контекстов."""
+    chosen = storage if storage is not None else build_storage(settings)
     return MediaServices(
-        storage=storage if storage is not None else build_storage(settings),
+        storage=chosen,
         usage=usage if usage is not None else CompositeAssetUsage(),
+        audience=audience if audience is not None else CompositeAssetAudience(),
+        presenter=AssetPresenter(chosen, settings),
     )

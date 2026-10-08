@@ -24,13 +24,9 @@ from messunjerr.core.db import create_engine
 from messunjerr.core.ids import uuid7
 from messunjerr.identity.infra.models import UserRow
 from messunjerr.identity.infra.password_service import PasswordService
-from messunjerr.media.infra import models as media_models
 from messunjerr.profiles.infra.models import PrivacySettingsRow, ProfileRow
 from messunjerr.settings import Settings
-
-# Таблицы media регистрируются при импорте модуля: внешний ключ аватара ссылается на media.assets,
-# и без неё SQLAlchemy не соберёт порядок вставки профилей.
-REGISTERED_MODELS = (media_models.AssetRow,)
+from messunjerr.tables import register_tables
 
 SEED_PASSWORD = "seed-password-2026"  # noqa: S105 (общий пароль учебных аккаунтов, не секрет)
 SEED_DOMAIN = "example.com"
@@ -168,6 +164,7 @@ async def seed_database(
     settings: Settings, *, users: int, password: str = SEED_PASSWORD
 ) -> SeedResult:
     """Создаёт до `users` учебных аккаунтов; уже существующие пропускает."""
+    register_tables()  # внешний ключ аватара ссылается на media.assets: без неё не собрать порядок вставки
     if settings.strict_runtime:
         raise RuntimeError(f"seed запрещён при APP_ENV={settings.app_env}: это учебные данные")
     if users < 1:

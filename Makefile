@@ -32,7 +32,7 @@ m ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help init up down restart reset ps logs test test-unit lint format typecheck arch check \
-	migrate db-check revision seed psql redis-cli shell lock \
+	migrate db-check revision seed create-admin reprocess-media psql redis-cli shell lock \
 	up-prod-like down-prod-like reset-prod-like ps-prod-like logs-prod-like stand-test stand-ca \
 	stand-stats stand-reset-limits smoke deploy rollback rehearse-migration backup backup-status restore-drill
 
@@ -94,6 +94,12 @@ revision: ## Новая миграция по моделям: make revision m="�
 
 seed: ## Учебные аккаунты с профилями (make seed ARGS="--users 100"), повтор безопасен
 	$(TOOLS) python -m messunjerr seed $(ARGS)
+
+create-admin: ## Администратор: make create-admin ARGS="--email a@example.com --username boss" (пароль спросит команда)
+	$(TOOLS) python -m messunjerr create-admin $(ARGS)
+
+reprocess-media: ## Вернуть на обработку готовые изображения без вариантов (ресурсы времён S5)
+	$(TOOLS) python -m messunjerr reprocess-media
 
 psql: ## psql в базе разработки (суперпользователь)
 	$(COMPOSE) exec postgres psql -U postgres -d $(DB_NAME)

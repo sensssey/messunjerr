@@ -12,7 +12,12 @@ from pydantic import SecretStr
 
 from messunjerr.media.domain.ports import PresignedUpload, StorageUnavailableError
 from messunjerr.media.infra.memory import InMemoryObjectStorage, UnconfiguredStorage
-from messunjerr.media.infra.s3 import Deadlines, S3ObjectStorage, is_missing_object
+from messunjerr.media.infra.s3 import (
+    Deadlines,
+    S3ObjectStorage,
+    is_missing_object,
+    is_unsatisfiable_range,
+)
 from messunjerr.media.services import build_storage
 from messunjerr.settings import Settings, check_runtime
 
@@ -197,6 +202,18 @@ def test_a_missing_bucket_or_a_failure_is_not_a_missing_key(code: str, status: i
     assert not is_missing_object(client_error(code, status))
 
 
+@pytest.mark.parametrize(("code", "status"), [("InvalidRange", 416), ("Whatever", 416)])
+def test_a_range_of_an_empty_object_is_recognised(code: str, status: int) -> None:
+    assert is_unsatisfiable_range(client_error(code, status))
+
+
+@pytest.mark.parametrize(
+    ("code", "status"), [("NoSuchKey", 404), ("AccessDenied", 403), ("InternalError", 500)]
+)
+def test_other_errors_are_not_taken_for_an_empty_object(code: str, status: int) -> None:
+    assert not is_unsatisfiable_range(client_error(code, status))
+
+
 async def test_warming_up_creates_the_clients_without_touching_the_network() -> None:
     storage = new_storage(internal_endpoint="http://127.0.0.1:9")  # порт 9 закрыт
     try:
@@ -293,6 +310,25 @@ def test_production_refuses_to_start_without_the_storage_but_dev_does_not() -> N
     with pytest.raises(RuntimeError, match="S3_ENDPOINT_INTERNAL"):
         check_runtime(prod, needs_storage=True)
     check_runtime(settings_with(app_env="dev"), needs_storage=True)
+
+
+def test_only_the_api_needs_the_token_signing_key() -> None:
+    """Воркеры, особенно media (там разбираются недоверенные файлы), ключ подписи токенов не получают."""
+    without_key = settings_with(
+        app_env="stage",
+        public_base_url="https://messunjerr.localhost",
+        jwt_private_key=None,  # явно: иначе Settings возьмёт ключ из окружения контейнера
+        s3_endpoint_internal="http://seaweedfs:8333",
+        s3_access_key=SecretStr("a"),
+        s3_secret_key=SecretStr("b"),
+    )
+    assert without_key.jwt_private_key is None
+
+    with pytest.raises(RuntimeError, match="JWT_PRIVATE_KEY"):  # API: по умолчанию ключ обязателен
+        check_runtime(without_key, needs_storage=True)
+    check_runtime(
+        without_key, needs_storage=True, needs_jwt=False
+    )  # воркер media стартует без него
 
 
 def test_production_with_the_storage_configured_starts() -> None:

@@ -22,6 +22,7 @@ class Limits:
     message_attachments_max: int = 10
     avatar_max_bytes: int = 5 * MIB
     image_max_bytes: int = 10 * MIB
+    image_max_pixels: int = 25_000_000
     file_max_bytes: int = 25 * MIB
 
 

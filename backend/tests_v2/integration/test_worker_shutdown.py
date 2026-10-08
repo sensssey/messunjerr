@@ -7,10 +7,12 @@
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from typing import IO
 
 import pytest
@@ -71,3 +73,42 @@ def test_a_worker_stops_cleanly_on_sigterm(test_settings: Settings, queue: str) 
         output
     )  # on_shutdown выполнен: пул БД, очередь и клиент закрыты
     assert code == 0, output
+
+
+def test_a_worker_serves_metrics_on_its_port_and_frees_it_on_exit(test_settings: Settings) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    env = {
+        **os.environ,
+        "DATABASE_URL": test_settings.database_url.get_secret_value(),
+        "REDIS_URL": test_settings.redis_url.get_secret_value(),
+        "LOG_FORMAT": "json",
+        "LOG_LEVEL": "INFO",
+        "WORKER_METRICS_PORT": str(port),
+    }
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "messunjerr", "worker", "--queue", "media"],
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            started = _wait_for(log, "worker_started", STARTUP_SECONDS)
+            assert "worker_started" in started, started
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as page:
+                body = page.read().decode()
+            assert "process_cpu_seconds_total" in body
+            assert "media_processing_seconds" in body  # метрики обработки объявлены с запуска
+            process.send_signal(signal.SIGTERM)
+            code = process.wait(timeout=STOP_SECONDS)
+        finally:
+            if process.poll() is None:
+                process.kill()
+        log.seek(0)
+        output = log.read()
+
+    assert code == 0, output
+    with pytest.raises(OSError):  # noqa: PT011 (порт освобождён: отказ в соединении)
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2)

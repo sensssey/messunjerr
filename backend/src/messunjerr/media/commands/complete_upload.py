@@ -2,7 +2,7 @@
 
 Сервер проверяет объект запросом `HEAD` (он на месте, размер равен заявленному) и переводит ресурс в
 `uploaded`; задачу `process_media` ставит после коммита. Повторный вызов идемпотентен: ресурс уже не
-`pending`, поэтому возвращается его текущее состояние. Запрос к хранилищу идёт между двумя
+`pending`, поэтому возвращается его текущее состояние (у готового со ссылками). Запрос к хранилищу идёт между двумя
 транзакциями: на это время соединение возвращается в пул и строка не заблокирована, поэтому
 зависшее хранилище не вытесняет из пула остальные запросы.
 """
@@ -24,8 +24,8 @@ from messunjerr.media.domain.ports import ObjectStorage, StorageUnavailableError
 from messunjerr.media.domain.rules import Kind, Purpose, RejectReason, Status, max_bytes
 from messunjerr.media.infra.models import AssetRow
 from messunjerr.media.infra.repositories import AssetRepository
-from messunjerr.media.queries.assets import asset_dto
 from messunjerr.media.queries.models import Asset
+from messunjerr.media.queries.presenter import AssetPresenter
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +49,7 @@ async def complete_upload(
     uow: UnitOfWork,
     storage: ObjectStorage,
     jobs: JobQueue,
+    presenter: AssetPresenter,
     now: datetime | None = None,
 ) -> Asset:
     moment = now or utcnow()
@@ -57,7 +58,7 @@ async def complete_upload(
     if row is None:
         raise NotFoundError("The asset does not exist or is not yours.")
     if row.status != Status.PENDING:
-        return asset_dto(row)  # повтор: состояние уже продвинулось, отдаём как есть
+        return await presenter.card(row)  # повтор: состояние уже продвинулось, отдаём как есть
     object_key = row.object_key
     await uow.rollback()  # отпускаем соединение: хранилище может отвечать секундами
 
@@ -73,7 +74,7 @@ async def complete_upload(
     if row is None:
         raise NotFoundError("The asset does not exist or is not yours.")
     if row.status != Status.PENDING:
-        return asset_dto(row)
+        return await presenter.card(row)
 
     row.size_bytes = stored.size
     reason = size_problem(row, stored.size)
@@ -95,4 +96,4 @@ async def complete_upload(
     uow.after_commit(partial(enqueue_processing, jobs, row.id))
     await uow.commit()
     get_logger("messunjerr.media").info("upload_completed", asset_id=str(row.id))
-    return asset_dto(row)
+    return await presenter.card(row)

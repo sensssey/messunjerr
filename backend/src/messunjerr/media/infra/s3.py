@@ -33,6 +33,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from messunjerr.core.logs import get_logger
 from messunjerr.media.domain.ports import (
     ListedObject,
+    ObjectTooLargeError,
     PresignedUpload,
     StorageUnavailableError,
     StoredObject,
@@ -58,6 +59,8 @@ class Deadlines:
     head: float = 8.0
     read: float = 20.0
     delete: float = 60.0
+    transfer: float = 60.0
+    """Объект целиком (до 10 МиБ у изображений): чтение для обработки и запись вариантов."""
 
 
 def is_missing_object(error: ClientError) -> bool:
@@ -65,6 +68,17 @@ def is_missing_object(error: ClientError) -> bool:
     на `HEAD` без тела приходит с кодом «404» и от отсутствующего ключа неотличим)."""
     response = cast("dict[str, Any]", error.response)
     return str(response.get("Error", {}).get("Code", "")) in _MISSING_CODES
+
+
+def is_unsatisfiable_range(error: ClientError) -> bool:
+    """Просили диапазон у пустого объекта: S3 отвечает `416 InvalidRange` (проверено на SeaweedFS).
+
+    Пустые объекты у нас бывают: на месте оригинала обработанного изображения лежит пустая заглушка.
+    """
+    response = cast("dict[str, Any]", error.response)
+    code = str(response.get("Error", {}).get("Code", ""))
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code == "InvalidRange" or status == 416
 
 
 class S3ObjectStorage:
@@ -225,9 +239,77 @@ class S3ObjectStorage:
         except ClientError as error:
             if is_missing_object(error):
                 return None
+            if is_unsatisfiable_range(error):
+                return b""  # объект есть, но пустой: диапазон в нём брать не из чего
             raise self._unavailable("read_head", error) from error
         except _NETWORK_ERRORS as error:
             raise self._unavailable("read_head", error) from error
+
+    async def read_object(self, key: str, max_bytes: int) -> bytes | None:
+        internal, _ = await self._clients()
+        try:
+            async with asyncio.timeout(self._deadlines.transfer):
+                response = await internal.get_object(Bucket=self._bucket, Key=key)
+                async with response["Body"] as stream:
+                    if int(response.get("ContentLength", 0)) > max_bytes:
+                        raise ObjectTooLargeError(key)
+                    data = bytes(await stream.read())
+        except ClientError as error:
+            if is_missing_object(error):
+                return None
+            raise self._unavailable("read", error) from error
+        except _NETWORK_ERRORS as error:
+            raise self._unavailable("read", error) from error
+        if len(data) > max_bytes:  # длину ответ не назвал или назвал неверно
+            raise ObjectTooLargeError(key)
+        return data
+
+    async def write_object(
+        self, key: str, body: bytes, *, content_type: str, cache_control: str | None = None
+    ) -> None:
+        internal, _ = await self._clients()
+        options: dict[str, Any] = {
+            "Bucket": self._bucket,
+            "Key": key,
+            "Body": body,
+            "ContentType": content_type,
+        }
+        if cache_control is not None:
+            options["CacheControl"] = cache_control
+        try:
+            async with asyncio.timeout(self._deadlines.transfer):
+                await internal.put_object(**options)
+        except ClientError as error:
+            raise self._unavailable("write", error) from error
+        except _NETWORK_ERRORS as error:
+            raise self._unavailable("write", error) from error
+
+    async def presign_get(
+        self,
+        *,
+        key: str,
+        expires_in: int,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+        cache_control: str | None = None,
+    ) -> str:
+        _, public = await self._clients()
+        params: dict[str, Any] = {"Bucket": self._bucket, "Key": key}
+        # Заголовки ответа задаёт сама ссылка: SeaweedFS подставляет их вместо сохранённых.
+        if content_type is not None:
+            params["ResponseContentType"] = content_type
+        if content_disposition is not None:
+            params["ResponseContentDisposition"] = content_disposition
+        if cache_control is not None:
+            params["ResponseCacheControl"] = cache_control
+        try:
+            return str(
+                await public.generate_presigned_url(
+                    "get_object", Params=params, ExpiresIn=expires_in, HttpMethod="GET"
+                )
+            )
+        except _NETWORK_ERRORS as error:  # подпись локальная; сюда попадёт лишь сбой настройки
+            raise self._unavailable("presign_get", error) from error
 
     async def delete_many(self, keys: Sequence[str]) -> None:
         if not keys:

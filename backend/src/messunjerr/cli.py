@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import getpass
 import os
 import sys
 import urllib.error
@@ -86,6 +87,72 @@ def _seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _create_admin(args: argparse.Namespace) -> int:
+    from messunjerr.admin import (  # тяжёлые импорты только этой команде
+        AdminError,
+        PasswordRequiredError,
+        create_admin,
+    )
+    from messunjerr.tables import register_tables
+
+    register_tables()  # профиль ссылается на другие схемы: без их таблиц запись не соберётся
+    settings = get_settings()
+    # Пароль не принимается аргументом командной строки: он остался бы в истории оболочки.
+    password: str | None = (
+        sys.stdin.readline().rstrip("\r\n")
+        if args.password_stdin
+        else os.environ.get("ADMIN_PASSWORD") or None
+    )
+    try:
+        try:
+            result = asyncio.run(
+                create_admin(settings, email=args.email, username=args.username, password=password)
+            )
+        except PasswordRequiredError:
+            if not sys.stdin.isatty():
+                raise
+            first = getpass.getpass("Пароль нового администратора: ")
+            if first != getpass.getpass("Ещё раз: "):
+                raise AdminError("пароли не совпали") from None
+            result = asyncio.run(
+                create_admin(settings, email=args.email, username=args.username, password=first)
+            )
+    except AdminError as error:
+        print(f"create-admin: {error}", file=sys.stderr)
+        return 1
+    action = "создан администратор" if result.created else "роль admin выдана аккаунту"
+    print(f"create-admin: {action} {result.username} ({result.user_id})")
+    if result.ignored:
+        print(
+            f"create-admin: предупреждение: не применено: {', '.join(result.ignored)} "
+            "(у существующего аккаунта меняется только роль)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _reprocess_media(_: argparse.Namespace) -> int:
+    from messunjerr.core.db import create_engine, create_sessionmaker  # тяжёлые импорты
+    from messunjerr.jobs.queue import ArqJobQueue
+    from messunjerr.media.commands.reprocess import reprocess_legacy_images
+    from messunjerr.tables import register_tables
+
+    register_tables()  # ресурс ссылается на identity.users: без неё первая же запись падает
+
+    async def run() -> int:
+        settings = get_settings()
+        engine = create_engine(settings)
+        jobs = ArqJobQueue(settings.redis_url.get_secret_value())
+        try:
+            return await reprocess_legacy_images(create_sessionmaker(engine), jobs)
+        finally:
+            await jobs.close()
+            await engine.dispose()
+
+    print(f"reprocess-media: на обработку возвращено ресурсов: {asyncio.run(run())}")
+    return 0
+
+
 def _healthcheck(args: argparse.Namespace) -> int:
     """Для HEALTHCHECK контейнера: код 0, если процесс отвечает на /health/live."""
     try:
@@ -143,6 +210,24 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--users", type=int, default=30, help="сколько аккаунтов (по умолчанию 30)")
     seed.add_argument("--password", default=None, help="общий пароль (по умолчанию учебный)")
     seed.set_defaults(handler=_seed)
+
+    admin = sub.add_parser(
+        "create-admin",
+        help="создать администратора или выдать роль существующему аккаунту (по почте)",
+    )
+    admin.add_argument("--email", required=True)
+    admin.add_argument("--username", required=True)
+    admin.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="прочитать пароль новой учётной записи из stdin (иначе ADMIN_PASSWORD или запрос)",
+    )
+    admin.set_defaults(handler=_create_admin)
+
+    sub.add_parser(
+        "reprocess-media",
+        help="вернуть на обработку готовые изображения без вариантов (ресурсы времён S5)",
+    ).set_defaults(handler=_reprocess_media)
 
     health = sub.add_parser("healthcheck", help="проверить /health/live для HEALTHCHECK")
     health.add_argument("--url", default="http://127.0.0.1:8000/health/live")

@@ -19,6 +19,10 @@ class StorageUnavailableError(Exception):
     """Хранилище не ответило или ответило сбоем (5xx, обрыв, таймаут): операцию можно повторить."""
 
 
+class ObjectTooLargeError(Exception):
+    """Объект больше, чем разрешено читать целиком: повторять нечего, размер не изменится."""
+
+
 @dataclass(frozen=True, slots=True)
 class StoredObject:
     size: int
@@ -66,6 +70,34 @@ class ObjectStorage(Protocol):
         """Первые `length` байт объекта; `None`, если объекта нет."""
         ...
 
+    async def read_object(self, key: str, max_bytes: int) -> bytes | None:
+        """Объект целиком; `None`, если его нет. Больше `max_bytes`: `ObjectTooLargeError`.
+
+        Для обработки изображений: размер загрузки уже сверен с заявленным, а предел защищает
+        память воркера, если в bucket окажется что-то другое.
+        """
+        ...
+
+    async def write_object(
+        self, key: str, body: bytes, *, content_type: str, cache_control: str | None = None
+    ) -> None:
+        """Записывает объект (поверх существующего). Так пишут воркеры: варианты изображений и
+        пустую заглушку на месте оригинала. Клиентские загрузки идут по `presign_put`."""
+        ...
+
+    async def presign_get(
+        self,
+        *,
+        key: str,
+        expires_in: int,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+        cache_control: str | None = None,
+    ) -> str:
+        """Ссылка для `GET`. Заголовки ответа задаёт сама ссылка (`response-content-*`), а не
+        метаданные объекта: им верить нельзя (4.11, неподписанные заголовки). Считается локально."""
+        ...
+
     async def delete_many(self, keys: Sequence[str]) -> None:
         """Удаляет объекты; отсутствующие не ошибка (повтор безопасен)."""
         ...
@@ -88,4 +120,17 @@ class ObjectStorage(Protocol):
 class AssetUsage(Protocol):
     async def is_attached(self, session: AsyncSession, asset_id: uuid.UUID) -> bool:
         """Привязан ли ресурс к аватару, посту или сообщению: такой удалять нельзя (`asset_in_use`)."""
+        ...
+
+
+class AssetAudience(Protocol):
+    async def can_view(
+        self, session: AsyncSession, *, asset_id: uuid.UUID, viewer_id: uuid.UUID
+    ) -> bool:
+        """Вправе ли зритель (не владелец) получить ссылки на ресурс, то есть видеть объект, к
+        которому тот привязан: видимый пост, беседу, где зритель участник (5.8, `/urls`).
+
+        Каждый контекст отвечает за свои привязки (посты S11, сообщения S14); пока их нет, ссылки
+        получает только владелец.
+        """
         ...
