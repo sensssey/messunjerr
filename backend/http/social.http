@@ -1,0 +1,458 @@
+### messunjerr API v2: заявки в друзья, друзья, блокировки (спринт S7) и подписки (спринт S8)
+#
+# Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
+# токены из писем и идентификаторы тогда копируются руками). Стек поднимает `make up` или
+# `./dev.ps1 up`, письма смотрим в Mailpit: http://localhost:8025. Выполняйте запросы по порядку,
+# сверху вниз. Нужны два человека: Анна (a_*) и Борис (b_*), их заводят шаги 1-8.
+
+@host = http://localhost:8000
+@mailpit = http://localhost:8025
+@password = correct horse battery staple
+
+### Подготовка: Анна ###################################################################
+
+### 1. Регистрация Анны
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("a_user", "anna_" + suffix);
+    client.global.set("a_email", "anna_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{a_email}}",
+  "username": "{{a_user}}",
+  "password": "{{password}}",
+  "display_name": "Анна",
+  "accept_terms": true
+}
+
+### 2. Письмо подтверждения Анне
+GET {{mailpit}}/api/v1/search?query=to:{{a_email}}&limit=1
+
+> {%
+    client.global.set("a_mail_id", response.body.messages[0].ID);
+%}
+
+### 3. Токен из письма Анне
+GET {{mailpit}}/api/v1/message/{{a_mail_id}}
+
+> {%
+    client.global.set("a_verify", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 4. Подтверждение почты и вход Анны
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{a_verify}}" }
+
+> {%
+    client.global.set("a_token", response.body.access_token);
+    client.global.set("a_id", response.body.user.id);
+%}
+
+### Подготовка: Борис ###################################################################
+
+### 5. Регистрация Бориса
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("b_user", "boris_" + suffix);
+    client.global.set("b_email", "boris_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{b_email}}",
+  "username": "{{b_user}}",
+  "password": "{{password}}",
+  "display_name": "Борис",
+  "accept_terms": true
+}
+
+### 6. Письмо подтверждения Борису
+GET {{mailpit}}/api/v1/search?query=to:{{b_email}}&limit=1
+
+> {%
+    client.global.set("b_mail_id", response.body.messages[0].ID);
+%}
+
+### 7. Токен из письма Борису
+GET {{mailpit}}/api/v1/message/{{b_mail_id}}
+
+> {%
+    client.global.set("b_verify", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 8. Подтверждение почты и вход Бориса
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{b_verify}}" }
+
+> {%
+    client.global.set("b_token", response.body.access_token);
+    client.global.set("b_id", response.body.user.id);
+%}
+
+### Заявка в друзья ######################################################################
+
+### 9. Анна зовёт Бориса в друзья: 201, в ответе заявка со статусом pending
+# `Idempotency-Key` необязателен: повтор с тем же ключом вернёт тот же ответ (заголовок
+# `Idempotency-Replayed: true`), а не вторую заявку. Лимит: 30 новых заявок в сутки на человека.
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+Idempotency-Key: {{$uuid}}
+
+{ "user_id": "{{b_id}}" }
+
+> {%
+    client.global.set("request_id", response.body.id);
+%}
+
+### 10. Анна уже отправила заявку: 409 friend_request_exists
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "{{b_id}}" }
+
+### 11. Борис видит заявку среди входящих (direction=incoming по умолчанию)
+GET {{host}}/api/v1/friend-requests
+Authorization: Bearer {{b_token}}
+
+### 12. Анна видит её среди исходящих
+GET {{host}}/api/v1/friend-requests?direction=outgoing
+Authorization: Bearer {{a_token}}
+
+### 13. Профиль Бориса глазами Анны: relationship.friendship = request_sent, в нём id заявки
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+### 14. В шапке Бориса одна заявка ждёт ответа: counters.pending_friend_requests = 1
+GET {{host}}/api/v1/me
+Authorization: Bearer {{b_token}}
+
+### 15. Анна не может принять свою же заявку: 404 not_found (для неё этой заявки «нет»)
+POST {{host}}/api/v1/friend-requests/{{request_id}}/accept
+Authorization: Bearer {{a_token}}
+
+### 16. Борис принимает: 200, в ответе новый друг и дата дружбы
+POST {{host}}/api/v1/friend-requests/{{request_id}}/accept
+Authorization: Bearer {{b_token}}
+
+### 17. Повторное принятие: 409 friend_request_not_pending
+POST {{host}}/api/v1/friend-requests/{{request_id}}/accept
+Authorization: Bearer {{b_token}}
+
+### Друзья ###############################################################################
+
+### 18. Друзья Анны (новые сверху); `q` ищет по нику и имени среди друзей, `%` и `_` не шаблоны
+GET {{host}}/api/v1/friends
+Authorization: Bearer {{a_token}}
+
+###
+GET {{host}}/api/v1/friends?q=bor&limit=20
+Authorization: Bearer {{a_token}}
+
+### 19. Профиль Бориса: relationship.friendship = friends
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+### 20. Список друзей Бориса глазами Анны: по умолчанию друзей видят только друзья
+# Хозяин списка меняет это в PATCH /me/privacy (friends_list_visibility: everyone, friends, only_me).
+# Закрытый профиль закрывает список от чужих (403 profile_private), настройка `only_me` даёт
+# 403 list_hidden, а у каждого человека в списке есть relationship зрителя.
+GET {{host}}/api/v1/users/{{b_user}}/friends
+Authorization: Bearer {{a_token}}
+
+### 21. Общие друзья Анны и Бориса (у своего профиля список пустой)
+GET {{host}}/api/v1/users/{{b_user}}/mutual-friends
+Authorization: Bearer {{a_token}}
+
+### 22. Анна убирает Бориса из друзей: 204, дружба кончается у обоих
+DELETE {{host}}/api/v1/friends/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### 23. Не друзья: 404 not_found
+DELETE {{host}}/api/v1/friends/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### Отказ, отмена и встречная заявка ######################################################
+
+### 24. Анна снова зовёт Бориса
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "{{b_id}}" }
+
+> {%
+    client.global.set("request_id", response.body.id);
+%}
+
+### 25. Анна передумала: отмена, 204 (события в outbox нет)
+DELETE {{host}}/api/v1/friend-requests/{{request_id}}
+Authorization: Bearer {{a_token}}
+
+### 26. Борис зовёт Анну, Анна отвечает встречной заявкой: она принимается сразу
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{b_token}}
+Content-Type: application/json
+
+{ "user_id": "{{a_id}}" }
+
+> {%
+    client.global.set("request_id", response.body.id);
+%}
+
+###
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "{{b_id}}" }
+
+# Ответ 200: та же заявка, статус accepted. Дружба появилась одна, даже если оба нажали в один миг.
+
+### 27. Отказ: Борис убирает дружбу, Анна зовёт, Борис отклоняет (204; Анна об отказе не узнаёт)
+DELETE {{host}}/api/v1/friends/{{a_id}}
+Authorization: Bearer {{b_token}}
+
+###
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "{{b_id}}" }
+
+> {%
+    client.global.set("request_id", response.body.id);
+%}
+
+###
+POST {{host}}/api/v1/friend-requests/{{request_id}}/decline
+Authorization: Bearer {{b_token}}
+
+### Блокировки ###########################################################################
+
+### 28. Анна блокирует Бориса: 204, в одной транзакции исчезают дружба и живые заявки
+PUT {{host}}/api/v1/blocks/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### 29. Они больше не видят друг друга: 404 not_found в обе стороны
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+###
+GET {{host}}/api/v1/users/{{a_user}}
+Authorization: Bearer {{b_token}}
+
+### 30. Заявку заблокированному и заблокировавшему отправить нельзя: тот же 404, что и несуществующему
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{b_token}}
+Content-Type: application/json
+
+{ "user_id": "{{a_id}}" }
+
+### 31. Мои блокировки (видит только Анна; Борис о блокировке не узнаёт)
+GET {{host}}/api/v1/me/blocks
+Authorization: Bearer {{a_token}}
+
+### 32. Повторная блокировка идемпотентна: 204, событие в outbox пишется один раз
+PUT {{host}}/api/v1/blocks/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### 33. Борис блокирует Анну в ответ: 404 not_found
+# Того, кто заблокировал вас, для вас нет (его профиль тоже 404), взаимной блокировки не бывает.
+# Когда Анна снимет свою блокировку, Борис сможет заблокировать её сам.
+PUT {{host}}/api/v1/blocks/{{a_id}}
+Authorization: Bearer {{b_token}}
+
+### 34. Снять блокировку: 204; дружба и заявки не возвращаются, дальше всё заново
+DELETE {{host}}/api/v1/blocks/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### Подписки (спринт S8) ##################################################################
+
+### 35. Борис разрешает всем видеть его подписчиков и подписки (по умолчанию их видят только друзья)
+PATCH {{host}}/api/v1/me/privacy
+Authorization: Bearer {{b_token}}
+Content-Type: application/json
+
+{ "followers_list_visibility": "everyone" }
+
+### 36. Анна подписывается на Бориса: профиль открыт, подписка сразу, 200 {"status": "following"}
+# Лимит `follow`: 100 подписок в час на человека. Повтор тоже отвечает 200 и новых событий не пишет.
+PUT {{host}}/api/v1/follows/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### 37. Профиль Бориса глазами Анны: relationship.following = following, counters.followers = 1
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+### 38. Подписки Анны и подписчики Бориса (новые сверху, карточки UserSummary)
+GET {{host}}/api/v1/me/following
+Authorization: Bearer {{a_token}}
+
+###
+GET {{host}}/api/v1/me/followers
+Authorization: Bearer {{b_token}}
+
+### 39. Чужой список: подписчики Бориса глазами Анны (карточки с relationship зрителя)
+# Подписчики и подписки подчиняются одной настройке владельца `followers_list_visibility`
+# (everyone, friends, only_me): закрытая настройка даёт 403 list_hidden, закрытый профиль
+# для чужих 403 profile_private. Эти же два списка есть у /users/{ref}/following.
+GET {{host}}/api/v1/users/{{b_user}}/followers
+Authorization: Bearer {{a_token}}
+
+### 40. Борис закрывает профиль: нынешние подписчики остаются, новые подписываются запросом
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{b_token}}
+Content-Type: application/json
+
+{ "is_private": true }
+
+### 41. Анна отписывается (204 всегда) и подписывается заново: 200 {"status": "requested"}
+DELETE {{host}}/api/v1/follows/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+###
+PUT {{host}}/api/v1/follows/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+### 42. Профиль закрыт: Анне виден базовый вид, relationship.following = requested
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+### 43. Борис видит запрос (id в ответе) и счётчик в шапке: counters.pending_follow_requests = 1
+GET {{host}}/api/v1/me/follow-requests
+Authorization: Bearer {{b_token}}
+
+> {%
+    client.global.set("follow_request_id", response.body.items[0].id);
+%}
+
+###
+GET {{host}}/api/v1/me
+Authorization: Bearer {{b_token}}
+
+### 44. Борис одобряет: 200, в ответе новый подписчик
+POST {{host}}/api/v1/me/follow-requests/{{follow_request_id}}/approve
+Authorization: Bearer {{b_token}}
+
+### 45. Повторное одобрение: 409 follow_request_not_pending
+POST {{host}}/api/v1/me/follow-requests/{{follow_request_id}}/approve
+Authorization: Bearer {{b_token}}
+
+### 46. Анна теперь подписчик закрытого профиля: видит его подробности и списки
+GET {{host}}/api/v1/users/{{b_user}}
+Authorization: Bearer {{a_token}}
+
+###
+GET {{host}}/api/v1/users/{{b_user}}/followers
+Authorization: Bearer {{a_token}}
+
+### 47. Борис убирает подписчика: 204 (ждущие запросы эта ручка не трогает)
+DELETE {{host}}/api/v1/me/followers/{{a_id}}
+Authorization: Bearer {{b_token}}
+
+### 48. Анна просит снова, Борис отклоняет: 204 (Анна об отказе не узнаёт)
+PUT {{host}}/api/v1/follows/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+###
+GET {{host}}/api/v1/me/follow-requests
+Authorization: Bearer {{b_token}}
+
+> {%
+    client.global.set("follow_request_id", response.body.items[0].id);
+%}
+
+###
+POST {{host}}/api/v1/me/follow-requests/{{follow_request_id}}/decline
+Authorization: Bearer {{b_token}}
+
+### 49. Анна просит ещё раз, Борис открывает профиль: запрос одобряется сам, в той же транзакции
+PUT {{host}}/api/v1/follows/{{b_id}}
+Authorization: Bearer {{a_token}}
+
+###
+PATCH {{host}}/api/v1/me/profile
+Authorization: Bearer {{b_token}}
+Content-Type: application/json
+
+{ "is_private": false }
+
+###
+GET {{host}}/api/v1/me/followers
+Authorization: Bearer {{b_token}}
+
+### 50. Блокировка рвёт подписки в обе стороны и закрывает запросы: Борис блокирует Анну
+PUT {{host}}/api/v1/blocks/{{a_id}}
+Authorization: Bearer {{b_token}}
+
+###
+GET {{host}}/api/v1/me/followers
+Authorization: Bearer {{b_token}}
+
+### 51. Борис снимает блокировку: подписки не возвращаются
+DELETE {{host}}/api/v1/blocks/{{a_id}}
+Authorization: Bearer {{b_token}}
+
+### Негативные случаи ####################################################################
+
+### Подписаться на себя: 400 self_action
+PUT {{host}}/api/v1/follows/{{a_id}}
+Authorization: Bearer {{a_token}}
+
+### Нет такого человека: 404 not_found (так же отвечает заблокированный и не активный аккаунт)
+PUT {{host}}/api/v1/follows/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80
+Authorization: Bearer {{a_token}}
+
+### Не идентификатор: 422 validation_error по pointer /path/user_id
+PUT {{host}}/api/v1/follows/не-идентификатор
+Authorization: Bearer {{a_token}}
+
+### Битый курсор подписок: 400 invalid_cursor
+GET {{host}}/api/v1/me/following?cursor=abc
+Authorization: Bearer {{a_token}}
+
+### Заявки на подписку нет: 404 not_found
+POST {{host}}/api/v1/me/follow-requests/0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80/approve
+Authorization: Bearer {{a_token}}
+
+### Заявка самому себе: 400 self_action
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "{{a_id}}" }
+
+### Нет такого человека: 404 not_found (так же отвечает заблокированный и не активный аккаунт)
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "0192b7a0-5c1e-7c3a-9d54-3f1a2b6c7d80" }
+
+### Не идентификатор: 422 validation_error по pointer /body/user_id
+POST {{host}}/api/v1/friend-requests
+Authorization: Bearer {{a_token}}
+Content-Type: application/json
+
+{ "user_id": "не-идентификатор" }
+
+### Заблокировать себя: 400 self_action
+PUT {{host}}/api/v1/blocks/{{a_id}}
+Authorization: Bearer {{a_token}}
+
+### Битый курсор: 400 invalid_cursor
+GET {{host}}/api/v1/friends?cursor=abc
+Authorization: Bearer {{a_token}}
+
+### Без токена: 401 token_missing
+GET {{host}}/api/v1/friends

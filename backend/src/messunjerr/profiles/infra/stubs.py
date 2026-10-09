@@ -4,6 +4,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from messunjerr.core.me import MeCounters
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.profiles.domain.ports import (
     AvatarCheck,
@@ -42,3 +43,21 @@ class ZeroCounters:
 
     async def of(self, session: AsyncSession, user_id: uuid.UUID) -> ProfileCounts:
         return ProfileCounts()
+
+
+class ZeroMeCounters:
+    """Счётчики шапки клиента без контекстов выше (заявки в друзья, уведомления, беседы): нули."""
+
+    async def of(self, session: AsyncSession, user_id: uuid.UUID) -> MeCounters:
+        return MeCounters()
+
+
+class NoFollowsYet:
+    """Без социального графа подписок нет, и открытие профиля не на ком проверять: ничего не делает.
+
+    Приложение подставляет настоящую реализацию (`messunjerr.social.commands.follows`); заглушка
+    нужна тестам и командам, которые собирают профили отдельно (`messunjerr.admin`).
+    """
+
+    async def profile_opened(self, uow: UnitOfWork, *, owner_id: uuid.UUID) -> None:
+        return None

@@ -1,4 +1,4 @@
-"""Журнал доступа Caddy не содержит токенов, cookie и подписей presigned URL (⚖️ 4.15)."""
+"""Журнал доступа Caddy не содержит токенов, cookie, подписей presigned URL и текста поиска (⚖️ 4.15)."""
 
 import asyncio
 import json
@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from .conftest import Stand
+from .conftest import Account, Stand
 from .sigv4 import presign_url
 
 TAIL_BYTES = 4 * 1024 * 1024
@@ -58,6 +58,21 @@ async def test_tokens_cookies_and_tickets_never_reach_the_access_log(
     text = log_text(stand.access_log)
     for secret in (f"ticket-{marker}", f"bearer-{marker}", f"cookie-{marker}"):
         assert secret not in text
+
+
+async def test_search_text_never_reaches_the_access_log(
+    client: httpx.AsyncClient, stand: Stand, account: Account
+) -> None:
+    """⚖️ В тексте поиска имена людей: журнал доступа хранится 90 дней, `q` в нём заменён."""
+    needle = f"find-{uuid.uuid4().hex[:12]}"
+    for path in ("/api/v1/search/users", "/api/v1/friends"):
+        visible = uuid.uuid4().hex[:12]
+        await client.get(f"{path}?q={needle}&visible={visible}", headers=account.headers)
+        entry = await entry_with(stand.access_log, f"visible={visible}")
+
+        assert "q=REDACTED" in entry["request"]["uri"], path
+        assert f"visible={visible}" in entry["request"]["uri"]  # остальные параметры остаются
+    assert needle not in log_text(stand.access_log)
 
 
 async def test_presigned_signatures_never_reach_the_access_log(

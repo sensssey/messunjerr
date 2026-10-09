@@ -1,4 +1,4 @@
-"""Проверка конфигурации Caddy: ни один журнал не пишет ticket и подписи presigned URL открытым текстом.
+"""Проверка конфигурации Caddy: журналы не пишут ticket, подписи presigned URL и текст поиска `q`.
 
 Читает из stdin адаптированный конфиг (`caddy adapt --config deploy/Caddyfile`) и проверяет:
 
@@ -19,7 +19,7 @@ import json
 import sys
 from typing import Any
 
-SECRET_PARAMETERS = {"ticket", "X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token"}
+SECRET_PARAMETERS = {"ticket", "X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token", "q"}
 DELETED_FIELDS = {
     "request>headers>Authorization",
     "request>headers>Cookie",

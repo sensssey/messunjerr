@@ -34,6 +34,8 @@ from messunjerr.profiles.api.routers import api_router as profiles_api_router
 from messunjerr.profiles.infra.usage import ProfileAvatarUsage
 from messunjerr.profiles.services import create_profile_services
 from messunjerr.settings import Settings, check_runtime, get_settings
+from messunjerr.social.api.routers import api_router as social_api_router
+from messunjerr.social.services import create_social_services
 from messunjerr.spike import spike_router
 from messunjerr.system import api_router, health_router
 
@@ -60,8 +62,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     injected: JobQueue | None = app.state.job_queue
     arq_queue = ArqJobQueue(settings.redis_url.get_secret_value()) if injected is None else None
     jobs: JobQueue = injected if injected is not None else cast(ArqJobQueue, arq_queue)
-    # Порты профилей: аватары реализует медиа, граф и контент пока заглушки (S7–S8, S11).
-    profiles = create_profile_services(avatars=MediaAvatarAssets(jobs))
+    # Порты профилей: аватары реализует медиа; отношения, счётчики друзей и подписок, запросы на
+    # подписку в шапке и одобрение запросов при открытии профиля реализует социальный граф (S7, S8);
+    # посты (S11) подключатся тем же способом.
+    social = create_social_services()
+    profiles = create_profile_services(
+        avatars=MediaAvatarAssets(jobs),
+        relationships=social.relationships,
+        counters=social.counters,
+        me_counters=social.me_counters,
+        visibility=social.visibility,
+    )
     # identity ниже profiles в графе контекстов (4.2): создание профиля при регистрации и разделы
     # `MeUser` ему приносят порты, которые реализуют профили.
     identity = await create_identity_services(
@@ -78,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await media.storage.warm_up()
     app.state.identity = identity
     app.state.profiles = profiles
+    app.state.social = social
     app.state.media = media
     app.state.resources = AppResources(
         settings=settings,
@@ -158,6 +170,7 @@ def create_app(
     app.include_router(api_router)
     app.include_router(identity_api_router)
     app.include_router(profiles_api_router)
+    app.include_router(social_api_router)
     app.include_router(media_api_router)
     if settings.spike_endpoints_enabled:
         app.include_router(spike_router)

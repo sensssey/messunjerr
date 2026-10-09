@@ -18,7 +18,7 @@ from messunjerr.media.commands.queueing import enqueue_object_deletion
 from messunjerr.media.domain.events import AssetDeleted, record
 from messunjerr.media.domain.rules import Purpose, Status
 from messunjerr.media.infra.repositories import AssetRepository
-from messunjerr.profiles.domain.ports import AvatarCheck
+from messunjerr.profiles.api_public import AvatarCheck
 
 
 class MediaAvatarAssets:

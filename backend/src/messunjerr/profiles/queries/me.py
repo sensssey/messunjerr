@@ -58,10 +58,13 @@ async def get_privacy(session: AsyncSession, user_id: uuid.UUID) -> PrivacySetti
     return privacy_dto(row)
 
 
-async def load_me_extras(session: AsyncSession, user_id: uuid.UUID) -> MeExtras:
-    """Профиль, приватность, счётчики и обязательные действия для `MeUser` одним запросом.
+async def load_me_extras(
+    session: AsyncSession, user_id: uuid.UUID, *, counters: MeCounters | None = None
+) -> MeExtras:
+    """Профиль, приватность, счётчики и обязательные действия для `MeUser`.
 
-    Счётчики пока нулевые (друзья, уведомления и беседы появятся в S7, S10, S14), обязательных
+    Счётчики приходят из контекстов выше через порт (`counters`): входящие заявки в друзья даёт
+    social (S7), уведомления и беседы добавят S10 и S14; без порта они нулевые. Обязательных
     действий в v1 нет (бэклог B-01).
     """
     row = (
@@ -77,6 +80,6 @@ async def load_me_extras(session: AsyncSession, user_id: uuid.UUID) -> MeExtras:
     return MeExtras(
         profile=profile_dto(profile),
         privacy=privacy_dto(privacy),
-        counters=MeCounters(),
+        counters=counters or MeCounters(),
         required_actions=[],
     )

@@ -1,5 +1,7 @@
 """Мелкие утилиты ядра: UUIDv7, курсоры, нормализация строк и формат времени."""
 
+import base64
+import json
 import time
 import unicodedata
 import uuid
@@ -75,6 +77,38 @@ def test_broken_cursor_is_rejected(token: str) -> None:
         decode_cursor(token, FeedCursor)
     assert caught.value.status == 400
     assert caught.value.code == "invalid_cursor"
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "9999-12-31T23:59:59-01:00",  # в UTC это уже год 10000
+        "9999-12-31T23:59:59.999999-00:01",
+        "0001-01-01T00:00:00+01:00",  # в UTC это год 0
+        "0001-01-01T00:00:00+00:00:01",
+    ],
+)
+def test_cursor_time_that_does_not_fit_the_database_is_invalid(stamp: str) -> None:
+    """Драйвер падает на таком времени с `DataError` (500): курсор обязан отвечать `400`."""
+    token = encode_json({"v": 1, "created_at": stamp, "id": str(uuid.UUID(int=7))})
+
+    with pytest.raises(InvalidCursorError):
+        decode_cursor(token, FeedCursor)
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    ["9999-12-31T23:59:59+00:00", "9999-12-31T22:59:59-01:00", "0001-01-01T01:00:00+01:00"],
+)
+def test_cursor_time_at_the_edge_that_does_fit_is_valid(stamp: str) -> None:
+    token = encode_json({"v": 1, "created_at": stamp, "id": str(uuid.UUID(int=7))})
+
+    assert decode_cursor(token, FeedCursor).created_at == datetime.fromisoformat(stamp)
+
+
+def encode_json(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
 
 
 def test_cursor_of_another_list_is_rejected() -> None:

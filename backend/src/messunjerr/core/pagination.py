@@ -8,10 +8,11 @@ import base64
 import binascii
 import json
 from collections.abc import Sequence
-from typing import Annotated, Literal
+from datetime import UTC, datetime
+from typing import Annotated, Literal, Self
 
 from fastapi import Query
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 from messunjerr.core.errors import InvalidCursorError
 
@@ -28,6 +29,19 @@ class Cursor(BaseModel):
     """Базовый класс курсора: у каждого списка свой набор полей ключа сортировки."""
 
     v: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def _times_fit_the_database(self) -> Self:
+        """Время с поясом у края диапазона (`9999-12-31T23:59:59-01:00`) при переводе в UTC выходит за
+        год 9999, и драйвер падает с `DataError` (500 вместо `400 invalid_cursor`). Проверяем перевод
+        сразу, для всех полей-времён любого курсора."""
+        for name, value in self:
+            if isinstance(value, datetime):
+                try:
+                    value.astimezone(UTC)
+                except (OverflowError, ValueError) as exc:
+                    raise ValueError(f"{name} is outside the supported range") from exc
+        return self
 
 
 class Page[T](BaseModel):

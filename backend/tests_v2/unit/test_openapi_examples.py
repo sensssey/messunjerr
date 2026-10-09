@@ -21,6 +21,16 @@ from messunjerr.media.api.schemas import (
 from messunjerr.media.queries.models import Asset, Quota
 from messunjerr.profiles.api.schemas import UpdatePrivacyRequest, UpdateProfileRequest
 from messunjerr.profiles.queries.models import UserProfile
+from messunjerr.social.api.schemas import SendFriendRequestBody
+from messunjerr.social.queries.follow_models import ApprovedFollower, FollowRequest, FollowStatus
+from messunjerr.social.queries.models import (
+    AcceptedFriend,
+    BlockEntry,
+    FriendEntry,
+    FriendRequest,
+    UserListItem,
+)
+from messunjerr.social.queries.search_models import UserSearchItem, UserSearchPage
 
 MODELS: list[type[BaseModel]] = [
     MeUser,
@@ -38,6 +48,17 @@ MODELS: list[type[BaseModel]] = [
     CompleteUploadResponse,
     Asset,
     Quota,
+    SendFriendRequestBody,
+    FriendRequest,
+    AcceptedFriend,
+    FriendEntry,
+    BlockEntry,
+    UserListItem,
+    FollowStatus,
+    FollowRequest,
+    ApprovedFollower,
+    UserSearchItem,
+    UserSearchPage,
 ]
 
 
@@ -58,7 +79,24 @@ def test_examples_pass_validation_by_their_own_model(model: type[BaseModel]) -> 
         assert model.model_validate(example)
 
 
-@pytest.mark.parametrize("model", [MeUser, MeProfile, UserProfile], ids=lambda m: m.__name__)
+STABLE_SHAPES = [
+    MeUser,
+    MeProfile,
+    UserProfile,
+    FriendRequest,
+    AcceptedFriend,
+    FriendEntry,
+    BlockEntry,
+    UserListItem,
+    FollowStatus,
+    FollowRequest,
+    ApprovedFollower,
+    UserSearchItem,
+    UserSearchPage,
+]
+
+
+@pytest.mark.parametrize("model", STABLE_SHAPES, ids=lambda m: m.__name__)
 def test_response_examples_show_every_key_of_the_stable_shape(model: type[BaseModel]) -> None:
     """Ответ всегда содержит все ключи (5.1); пример без `null`, поэтому ключей в нём столько же, сколько полей."""
     for example in examples_of(model):

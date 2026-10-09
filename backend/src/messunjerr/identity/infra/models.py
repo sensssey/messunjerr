@@ -44,6 +44,14 @@ class UserRow(Base):
         ),
         CheckConstraint(_in("role", ROLES), name="role"),
         CheckConstraint(_in("status", USER_STATUSES), name="status"),
+        # Поиск людей (S8-04, миграция 0008). Ник хранится в нижнем регистре, поэтому `username::text`
+        # без `lower()`: точное совпадение и префикс идут по btree, похожие ники по триграммам.
+        Index(
+            "ix_users_username_trgm",
+            text("(username::text) gin_trgm_ops"),
+            postgresql_using="gin",
+        ),
+        Index("ix_users_username_prefix", text("(username::text) text_pattern_ops")),
         {"schema": IDENTITY_SCHEMA},
     )
 

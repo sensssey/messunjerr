@@ -255,7 +255,7 @@ def project_copy(tmp_path: Path) -> Path:
 def test_project_respects_import_contracts(project_copy: Path) -> None:
     result = _lint_imports(project_copy)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 6 kept, 0 broken" in result.stdout
+    assert "Contracts: 8 kept, 0 broken" in result.stdout
 
 
 def test_lower_context_importing_higher_context_breaks_the_build(project_copy: Path) -> None:
@@ -326,7 +326,27 @@ def test_layers_inside_media_cannot_import_upwards(
     assert "BROKEN" in result.stdout
 
 
-@pytest.mark.parametrize("context", ["profiles", "media"])
+@pytest.mark.parametrize(
+    ("layer", "module"),
+    [
+        ("commands", "messunjerr.social.api.schemas"),
+        ("queries", "messunjerr.social.commands.friends"),
+        ("domain", "messunjerr.social.infra.models"),
+        ("infra", "messunjerr.social.queries.cards"),
+    ],
+)
+def test_layers_inside_social_cannot_import_upwards(
+    project_copy: Path, layer: str, module: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / "social" / layer / "violation.py").write_text(
+        f"import {module}\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize("context", ["profiles", "media", "social"])
 @pytest.mark.parametrize(
     "module",
     [
@@ -350,7 +370,7 @@ def test_a_higher_context_may_reach_identity_only_through_its_public_interface(
     assert "api_public" in result.stdout
 
 
-@pytest.mark.parametrize("context", ["profiles", "media"])
+@pytest.mark.parametrize("context", ["profiles", "media", "social"])
 def test_the_public_interface_of_identity_is_importable_from_higher_contexts(
     project_copy: Path, context: str
 ) -> None:
@@ -363,16 +383,67 @@ def test_the_public_interface_of_identity_is_importable_from_higher_contexts(
 
 
 def test_media_may_use_profiles_but_not_the_other_way_round(project_copy: Path) -> None:
-    # media стоит выше profiles в графе 4.2: сверху вниз можно (будущее: аватар в карточке).
-    (project_copy / "src" / "messunjerr" / "media" / "fine.py").write_text(
-        "from messunjerr.profiles import services\n", encoding="utf-8"
-    )
+    # media стоит выше profiles в графе 4.2: сверху вниз можно, но только через публичный интерфейс.
+    fine = project_copy / "src" / "messunjerr" / "media" / "fine.py"
+    fine.write_text("from messunjerr.profiles import api_public\n", encoding="utf-8")
     assert _lint_imports(project_copy).returncode == 0
 
     # Снизу вверх нельзя: profiles знает о файлах только через порт `AssetUsage` (собирает main).
-    (project_copy / "src" / "messunjerr" / "media" / "fine.py").unlink()
+    fine.unlink()
     (project_copy / "src" / "messunjerr" / "profiles" / "violation.py").write_text(
         "from messunjerr.media import services\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+
+
+@pytest.mark.parametrize("context", ["media", "social"])
+@pytest.mark.parametrize(
+    "module",
+    [
+        "messunjerr.profiles.services",
+        "messunjerr.profiles.domain.ports",  # порты берём из api_public, а не напрямую
+        "messunjerr.profiles.infra.models",
+        "messunjerr.profiles.queries.me",
+        "messunjerr.profiles.commands.update_profile",
+        "messunjerr.profiles.api.schemas",
+    ],
+)
+def test_a_higher_context_may_reach_profiles_only_through_its_public_interface(
+    project_copy: Path, context: str, module: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / context / "violation.py").write_text(
+        f"import {module}\n", encoding="utf-8"
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode != 0
+    assert "BROKEN" in result.stdout
+    assert "api_public" in result.stdout
+
+
+@pytest.mark.parametrize("context", ["media", "social"])
+def test_the_public_interface_of_profiles_is_importable_from_higher_contexts(
+    project_copy: Path, context: str
+) -> None:
+    (project_copy / "src" / "messunjerr" / context / "fine.py").write_text(
+        "from messunjerr.profiles.api_public import Relation, UserSummary, can_view_profile\n",
+        encoding="utf-8",
+    )
+    result = _lint_imports(project_copy)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [("media", "social"), ("social", "media"), ("profiles", "social")],
+)
+def test_neighbours_and_lower_contexts_cannot_import_social_or_media(
+    project_copy: Path, source: str, target: str
+) -> None:
+    # media и social стоят рядом в графе 4.2 и друг друга не видят; profiles ниже обоих.
+    (project_copy / "src" / "messunjerr" / source / "violation.py").write_text(
+        f"from messunjerr.{target} import services\n", encoding="utf-8"
     )
     result = _lint_imports(project_copy)
     assert result.returncode != 0
@@ -388,7 +459,7 @@ def test_core_importing_an_entry_point_breaks_the_build(project_copy: Path) -> N
     assert "BROKEN" in result.stdout
 
 
-@pytest.mark.parametrize("context", ["core", "identity", "profiles", "media"])
+@pytest.mark.parametrize("context", ["core", "identity", "profiles", "media", "social"])
 @pytest.mark.parametrize("entry_point", ["seeding", "main", "jobs"])
 def test_no_context_may_import_an_entry_point(
     project_copy: Path, context: str, entry_point: str

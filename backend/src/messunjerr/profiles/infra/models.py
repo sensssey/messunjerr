@@ -16,6 +16,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Text,
     Uuid,
     func,
@@ -56,6 +57,13 @@ class ProfileRow(Base):
         ),
         CheckConstraint("char_length(city) <= 100", name="city_length"),
         CheckConstraint("language ~ '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$'", name="language_format"),
+        # Поиск людей (S8-04, миграция 0008): «ё» и «е» одна буква, поэтому триграммы строятся по имени
+        # после `translate`; запрос поиска обязан писать то же выражение буква в букву.
+        Index(
+            "ix_profiles_display_name_trgm",
+            text("(translate(display_name, 'ёЁ', 'еЕ')) gin_trgm_ops"),
+            postgresql_using="gin",
+        ),
         {"schema": PROFILE_SCHEMA},
     )
 

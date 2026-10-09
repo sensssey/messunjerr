@@ -39,7 +39,9 @@ _AUTH_ERRORS = {**TOKEN_ERRORS, **problem_responses(ErrorCode.ACCOUNT_DELETION_P
         "`avatar_asset_id`: свой готовый ресурс с назначением `avatar` (`POST /media/uploads`), `null` убирает "
         "аватар; прежний аватар при замене и очистке удаляется вместе с файлами. Чужой, удалённый и "
         "несуществующий ресурс это `asset_not_found`, неготовый `asset_not_ready`, не того назначения "
-        "`asset_wrong_purpose`. Лимит `api_write`."
+        "`asset_wrong_purpose`. `is_private`: когда закрытый профиль становится открытым, все ждущие "
+        "запросы на подписку одобряются в той же транзакции (подписчики закрытого профиля при его "
+        "закрытии остаются, новые подписки идут через запрос). Лимит `api_write`."
     ),
     dependencies=[Depends(limit_user("api_write"))],
     responses={**_AUTH_ERRORS, **problem_responses(ErrorCode.VALIDATION_ERROR), **LIMIT_ERRORS},
@@ -56,6 +58,7 @@ async def update_profile_endpoint(
         uow=uow,
         settings=resources.settings,
         avatars=profiles.avatars,
+        visibility=profiles.visibility,
     )
 
 

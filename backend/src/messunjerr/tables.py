@@ -14,6 +14,7 @@ MODEL_MODULES = (
     "messunjerr.identity.infra.models",
     "messunjerr.profiles.infra.models",
     "messunjerr.media.infra.models",
+    "messunjerr.social.infra.models",
 )
 
 

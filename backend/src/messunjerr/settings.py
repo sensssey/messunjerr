@@ -155,7 +155,7 @@ class Settings(BaseSettings):
         default=None, description="по умолчанию: отпечаток ключа (RFC 7638)"
     )
     jwt_issuer: str = "messunjerr"
-    access_token_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    access_token_ttl_seconds: int = Field(default=1200, ge=60, le=3600)
     refresh_ttl_days: int = Field(default=30, ge=1, le=365)
     refresh_absolute_ttl_days: int = Field(default=90, ge=1, le=730)
     refresh_race_window_seconds: int = Field(

@@ -173,7 +173,7 @@ jobs:
           docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
             caddy fmt /etc/caddy/Caddyfile | diff -u deploy/Caddyfile - \
             || { echo "::error::выполните caddy fmt --overwrite deploy/Caddyfile"; exit 1; }
-      - name: Журналы Caddy (доступа, ошибок, служебный) скрывают ticket и подписи
+      - name: Журналы Caddy (доступа, ошибок, служебный) скрывают ticket, подписи и текст поиска
         run: |
           docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11-alpine \
             caddy adapt --config /etc/caddy/Caddyfile | python3 scripts/check_caddy_logging.py

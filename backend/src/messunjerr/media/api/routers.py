@@ -202,6 +202,7 @@ async def read_asset_urls_endpoint(
 @media_router.delete(
     "/{asset_id}",
     status_code=204,
+    response_class=Response,
     summary="Удалить ресурс",
     description=(
         "Допустимо, пока ресурс ни к чему не привязан (аватар, пост, сообщение). Объекты хранилища "
@@ -220,14 +221,13 @@ async def delete_asset_endpoint(
     uow: UowDep,
     resources: ResourcesDep,
     media: MediaDep,
-) -> Response:
+) -> None:
     await delete_asset(
         DeleteAsset(owner_id=principal.user_id, asset_id=asset_id),
         uow=uow,
         usage=media.usage,
         jobs=resources.jobs,
     )
-    return Response(status_code=204)
 
 
 api_router = APIRouter(prefix="/api/v1")

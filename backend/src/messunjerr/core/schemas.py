@@ -30,6 +30,15 @@ def normalize_text(value: str) -> str:
     return text
 
 
+def normalize_search(value: str | None) -> str | None:
+    """Строка поиска из query-параметра: как у тел запросов (NFC, края обрезаны, управляющие
+    символы запрещены, в том числе NUL, которого PostgreSQL не принимает); пустая строка значит
+    «без поиска»."""
+    if value is None:
+        return None
+    return normalize_text(value) or None
+
+
 def _normalize_if_text(value: Any) -> Any:
     return normalize_text(value) if isinstance(value, str) else value
 

@@ -118,7 +118,7 @@ class TokenService:
         self._ttl = timedelta(seconds=ttl_seconds)
         self._retired = dict(retired_public_keys or {})
         self._clock = clock
-        # Проверяются и текущий ключ, и прежние: токены, выданные до ротации, живут до 10 минут.
+        # Проверяются и текущий ключ, и прежние: токены, выданные до ротации, живут до 20 минут.
         self._verification_keys: dict[str, Ed25519PublicKey] = {
             **self._retired,
             self.key_id: self._public_key,

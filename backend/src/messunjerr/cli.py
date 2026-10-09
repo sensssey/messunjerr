@@ -87,6 +87,39 @@ def _seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _seed_big(args: argparse.Namespace) -> int:
+    from messunjerr.seeding import (  # тяжёлые импорты только этой команде
+        SEED_PASSWORD,
+        seed_big_database,
+    )
+
+    password: str = args.password or SEED_PASSWORD
+    try:
+        result = asyncio.run(
+            seed_big_database(get_settings(), users=args.users, password=password, seed=args.seed)
+        )
+    except (RuntimeError, ValueError) as error:
+        print(f"seed-big: {error}", file=sys.stderr)
+        return 1
+    print(f"seed-big: создано людей {result.created}, уже было {result.existing}")
+    print(
+        f"seed-big: добавлено дружб {result.friendships}, подписок {result.follows}, "
+        f"блокировок {result.blocks}, заявок в друзья {result.friend_requests}, "
+        f"запросов на подписку {result.follow_requests}"
+    )
+    for section, count in result.extras.items():
+        print(f"seed-big: {section}: {count}")
+    print(
+        f"seed-big: вход под big_00001 … big_{args.users:05d}, пароль {password}; "
+        f"заняло {result.seconds:.1f} с"
+    )
+    print(
+        "seed-big: статистику планировщика обновит автоочистка в течение минуты; для замеров планов "
+        "сразу после посева выполните ANALYZE от имени владельца таблиц"
+    )
+    return 0
+
+
 def _create_admin(args: argparse.Namespace) -> int:
     from messunjerr.admin import (  # тяжёлые импорты только этой команде
         AdminError,
@@ -210,6 +243,20 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--users", type=int, default=30, help="сколько аккаунтов (по умолчанию 30)")
     seed.add_argument("--password", default=None, help="общий пароль (по умолчанию учебный)")
     seed.set_defaults(handler=_seed)
+
+    seed_big = sub.add_parser(
+        "seed-big",
+        help="большой набор для замеров: люди big_00001…, друзья, подписки, блокировки, заявки "
+        "(только dev и test, повтор безопасен)",
+    )
+    seed_big.add_argument(
+        "--users", type=int, default=5000, help="сколько людей (по умолчанию 5000)"
+    )
+    seed_big.add_argument("--password", default=None, help="общий пароль (по умолчанию учебный)")
+    seed_big.add_argument(
+        "--seed", type=int, default=2026, help="зерно генератора: то же зерно даёт те же данные"
+    )
+    seed_big.set_defaults(handler=_seed_big)
 
     admin = sub.add_parser(
         "create-admin",

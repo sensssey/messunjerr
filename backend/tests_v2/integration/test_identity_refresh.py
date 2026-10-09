@@ -52,7 +52,7 @@ async def test_refresh_rotates_the_token_and_issues_a_new_access_token(
     body = response.json()
     assert set(body) == {"access_token", "token_type", "expires_in", "session_id", "user"}
     assert body["session_id"] == user.session_id
-    assert body["expires_in"] == 600
+    assert body["expires_in"] == 1200
     assert body["user"]["id"] == user.user_id
     assert body["access_token"] != user.auth["access_token"]
 
@@ -203,7 +203,7 @@ async def test_reuse_after_the_window_closes_the_session_and_warns_the_owner(
     assert row["revoked_at"] is not None
     assert row["revoked_reason"] == "reuse_detected"
     assert await redis_client.exists(f"sess:revoked:{user.session_id}") == 1
-    # Уже выданный access-токен перестаёт приниматься сразу, а не через 10 минут.
+    # Уже выданный access-токен перестаёт приниматься сразу, а не через 20 минут.
     revoked = await client.get(ME, headers=bearer(rotated.json()["access_token"]))
     assert (revoked.status_code, revoked.json()["code"]) == (401, "session_revoked")
     # Законный токен тоже мёртв: сессия закрыта целиком, нужен новый вход.

@@ -116,7 +116,7 @@ async def test_the_request_leaves_an_event_an_audit_entry_and_a_flag(
     assert entry["data"] == {"revoked_sessions": 0, "grace_days": 14}
     assert user.credentials["email"] not in str(entry)
     assert await redis_client.get(flag_key(user)) == "1"
-    assert 0 < await redis_client.ttl(flag_key(user)) <= 900  # токен 10 минут и запас
+    assert 0 < await redis_client.ttl(flag_key(user)) <= 1500  # токен 20 минут и запас 5 минут
 
 
 async def test_the_owner_is_told_by_email_when_the_data_will_be_removed(

@@ -58,3 +58,18 @@ on_unavailable = "allow"
 limit = 60
 window = "1h"
 on_unavailable = "allow"
+
+[friend_request]           # POST /friend-requests: заявки в друзья, по пользователю
+limit = 30
+window = "1d"
+on_unavailable = "allow"
+
+[follow]                   # PUT /follows/{user_id}: подписки и запросы на подписку, по пользователю
+limit = 100
+window = "1h"
+on_unavailable = "allow"
+
+[search]                   # GET /search/*: поиск людей (и позже постов и тегов), по пользователю
+limit = 30
+window = "1m"
+on_unavailable = "allow"

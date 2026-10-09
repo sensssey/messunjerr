@@ -11,6 +11,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import DBAPIError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 from starlette.types import Scope
@@ -51,6 +52,13 @@ _PYDANTIC_TO_ITEM: dict[str, ItemCode] = {
     "multiple_of": ItemCode.OUT_OF_RANGE,
 }
 _KNOWN_ITEM_CODES = {code.value for code in ItemCode}
+
+# Состояния PostgreSQL «подождите и повторите»: не дождались замка (`lock_timeout`, 5 с у роли `app`),
+# взаимная блокировка, сбой сериализации, запрос снят по `statement_timeout`. Это не поломка сервера,
+# а затор на общих строках (например, долгое открытие профиля с тысячами запросов), поэтому ответ
+# `503` с `Retry-After`, а не `500`.
+CONTENTION_SQLSTATES = frozenset({"55P03", "40P01", "40001", "57014"})
+CONTENTION_RETRY_SECONDS = 1
 
 
 class ProblemItem(BaseModel):
@@ -244,6 +252,19 @@ def install_problem_handlers(app: FastAPI) -> None:
             status = None
         headers = {k: v for k, v in (exc.headers or {}).items() if k.lower() == "allow"}
         return problem_response(code, request.scope, detail=detail, headers=headers, status=status)
+
+    @app.exception_handler(DBAPIError)
+    async def _database(request: Request, exc: DBAPIError) -> JSONResponse:
+        sqlstate = getattr(exc.orig, "sqlstate", None)
+        if sqlstate not in CONTENTION_SQLSTATES:
+            raise exc  # прочие ошибки БД остаются неожиданными: их ловит обработчик ниже, как и раньше
+        # Без `exc_info`: в тексте ошибки SQL, а это лишний шум; нужны только путь и состояние.
+        log.warning("database_contention", path=request.url.path, sqlstate=sqlstate)
+        return problem_response(
+            ErrorCode.SERVICE_UNAVAILABLE,
+            request.scope,
+            headers={"Retry-After": str(CONTENTION_RETRY_SECONDS)},
+        )
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:

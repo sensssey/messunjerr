@@ -39,9 +39,15 @@ class Base(DeclarativeBase):
 
 
 def create_engine(settings: Settings) -> AsyncEngine:
-    """Движок роли `app`. Соединения устанавливаются лениво, поэтому старт не зависит от БД."""
+    """Движок роли `app`. Соединения устанавливаются лениво, поэтому старт не зависит от БД.
+
+    ⚖️ `hide_parameters`: в тексте ошибки БД (а он попадает в журнал ошибок) нет значений параметров
+    запроса. Иначе при любом сбое в журнал ушли бы почта, ник, имя из поиска, то есть персональные
+    данные, которые журналам не положены (текст SQL остаётся).
+    """
     return create_async_engine(
         settings.database_url.get_secret_value(),
+        hide_parameters=True,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_timeout=settings.db_pool_timeout_seconds,

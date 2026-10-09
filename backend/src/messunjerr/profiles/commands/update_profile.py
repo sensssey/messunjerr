@@ -8,6 +8,10 @@
 - `avatar_asset_id` через порт медиа (`asset_not_found`, `asset_not_ready`, `asset_wrong_purpose`);
   замена и очистка аватара освобождают прежний ресурс (он удаляется вместе с объектами).
 
+Закрытый профиль, ставший открытым (`is_private`: `true` → `false`), сообщает об этом порту
+`ProfileVisibilityListener` в той же транзакции: social одобряет ждущие запросы на подписку (5.3).
+Обратный переход ничего не сообщает: подписчики остаются, новые подписки идут через запрос.
+
 Все найденные ошибки приходят одним ответом `422`.
 """
 
@@ -26,7 +30,7 @@ from messunjerr.profiles.domain.errors import (
     avatar_error,
     birth_date_error,
 )
-from messunjerr.profiles.domain.ports import AvatarAssets, AvatarCheck
+from messunjerr.profiles.domain.ports import AvatarAssets, AvatarCheck, ProfileVisibilityListener
 from messunjerr.profiles.domain.rules import check_birth_date
 from messunjerr.profiles.infra.repositories import ProfileRepository
 from messunjerr.profiles.queries.me import profile_dto
@@ -86,9 +90,16 @@ async def update_profile(
     uow: UnitOfWork,
     settings: Settings,
     avatars: AvatarAssets,
+    visibility: ProfileVisibilityListener,
     now: datetime | None = None,
 ) -> MeProfile:
-    """Применяет изменения и возвращает профиль владельца. Строка блокируется: правки не теряются."""
+    """Применяет изменения и возвращает профиль владельца.
+
+    Строка профиля блокируется `FOR UPDATE` первым делом: правки не теряются, а подписки на этот
+    профиль (они читают строку `FOR SHARE`) идут либо до этой транзакции, либо после неё. Замки пар
+    людей социальный граф берёт уже внутри `visibility.profile_opened`, то есть позже строки
+    профиля: порядок «строка профиля, затем замок пары» един для всех команд.
+    """
     moment = now or utcnow()
     row = await ProfileRepository(uow.session).get(command.user_id, for_update=True)
     if row is None:
@@ -96,11 +107,14 @@ async def update_profile(
     await _validate(command, uow=uow, settings=settings, avatars=avatars, today=moment.date())
 
     previous_avatar = row.avatar_asset_id
+    was_private = row.is_private
     for name, value in command.changes.items():
         if name not in PROFILE_FIELDS:
             raise ValueError(f"unknown profile field: {name}")
         setattr(row, name, (value or None) if name in _EMPTY_IS_NULL else value)
     if previous_avatar is not None and previous_avatar != row.avatar_asset_id:
         await avatars.release(uow, owner_id=command.user_id, asset_id=previous_avatar)
+    if was_private and not row.is_private:
+        await visibility.profile_opened(uow, owner_id=command.user_id)
     await uow.commit()
     return profile_dto(row)

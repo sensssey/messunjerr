@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from messunjerr.core.me import MeCounters
 from messunjerr.core.uow import UnitOfWork
 from messunjerr.profiles.domain.policies import Relation
 
@@ -89,3 +90,29 @@ class ProfileCounts:
 
 class ProfileCounters(Protocol):
     async def of(self, session: AsyncSession, user_id: uuid.UUID) -> ProfileCounts: ...
+
+
+class MeCountersSource(Protocol):
+    async def of(self, session: AsyncSession, user_id: uuid.UUID) -> MeCounters:
+        """Счётчики шапки клиента для `GET /me` (5.3): входящие заявки в друзья и запросы на подписку
+        даёт social, позже уведомления (S10) и беседы (S14) добавят свои части."""
+        ...
+
+
+class ProfileVisibilityListener(Protocol):
+    """Реакция контекстов выше на смену закрытости профиля (5.3, S8)."""
+
+    async def profile_opened(self, uow: UnitOfWork, *, owner_id: uuid.UUID) -> None:
+        """Профиль стал открытым (`is_private`: `true` → `false`).
+
+        Вызывается из `PATCH /me/profile` ВНУТРИ его транзакции, до фиксации и после того, как
+        команда взяла строку профиля владельца `FOR UPDATE`: social одобряет все ждущие запросы на
+        подписку этого владельца, и они фиксируются вместе со сменой закрытости. Порядок блокировок
+        «строка профиля, затем замок пары» держат все команды подписки (`social.commands.follows`).
+
+        Правило для новых писателей: сегодня `is_private` из `true` в `false` переводит только
+        `update_profile`. Любой другой код с таким переходом (админка, модерация) обязан вызвать этот
+        порт под строкой профиля `FOR UPDATE`, иначе на открытом профиле навсегда останется ждущий
+        запрос (спецификация 4.6, «Правило для новых писателей»).
+        """
+        ...

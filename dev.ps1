@@ -90,6 +90,7 @@ function Show-Help {
   db-check    alembic check: модели и миграции не расходятся
   revision    новая миграция по моделям: ./dev.ps1 revision "описание"
   seed        учебные аккаунты с профилями (./dev.ps1 seed --users 100); повтор безопасен
+  seed-big    большой набор для замеров: 5 000 человек, друзья, подписки, блокировки (./dev.ps1 seed-big --users 1000); повтор безопасен
   create-admin  администратор (./dev.ps1 create-admin --email a@example.com --username boss); пароль спросит команда
   reprocess-media  вернуть на обработку готовые изображения без вариантов (ресурсы времён S5)
   psql        psql в базе разработки (суперпользователь)
@@ -164,6 +165,7 @@ switch ($Cmd) {
         Invoke-Tools alembic revision --autogenerate -m ($Rest -join ' ')
     }
     'seed' { Invoke-Tools python -m messunjerr seed @Rest }
+    'seed-big' { Invoke-Tools python -m messunjerr seed-big @Rest }
     'create-admin' { Invoke-Tools python -m messunjerr create-admin @Rest }
     'reprocess-media' { Invoke-Tools python -m messunjerr reprocess-media }
     'psql' { Invoke-Compose exec postgres psql -U postgres -d (Get-EnvValue 'DB_NAME' 'messunjerr') }

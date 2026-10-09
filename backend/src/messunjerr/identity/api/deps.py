@@ -62,7 +62,7 @@ class Principal:
 
 bearer_scheme = HTTPBearer(
     auto_error=False,
-    description="Access-токен из `/auth/login` или `/auth/verify-email` (живёт 10 минут).",
+    description="Access-токен из `/auth/login` или `/auth/verify-email` (живёт 20 минут).",
 )
 
 

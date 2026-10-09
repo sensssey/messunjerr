@@ -9,6 +9,7 @@ import httpx
 import pytest
 import structlog
 from fastapi import FastAPI, Request
+from sqlalchemy.exc import DBAPIError
 
 from messunjerr.core.codes import PROBLEM_SPECS, ErrorCode
 from messunjerr.core.errors import DomainError, NotFoundError, RateLimitedError
@@ -25,6 +26,14 @@ HEX32 = re.compile(r"^[0-9a-f]{32}$")
 class Item(ApiModel):
     name: str
     qty: int
+
+
+class DriverError(Exception):
+    """Похоже на ошибку драйвера asyncpg в обёртке SQLAlchemy: код состояния лежит в `sqlstate`."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"driver error {sqlstate}")
+        self.sqlstate = sqlstate
 
 
 def build_app() -> FastAPI:
@@ -56,6 +65,10 @@ def build_app() -> FastAPI:
     @app.get("/boom")
     async def boom() -> None:
         raise RuntimeError(SECRET_INPUT)
+
+    @app.get("/database/{sqlstate}")
+    async def database(sqlstate: str) -> None:
+        raise DBAPIError("SELECT 1", (SECRET_INPUT,), DriverError(sqlstate))
 
     @app.post("/items")
     async def create(item: Item) -> Item:
@@ -132,6 +145,37 @@ async def test_unhandled_exception_hides_details(client: httpx.AsyncClient) -> N
     response = await client.get("/boom")
     assert_problem(response, ErrorCode.INTERNAL_ERROR, path="/boom")
     assert SECRET_INPUT not in response.text
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01", "40001", "57014"])
+async def test_database_contention_is_503_with_retry_after_and_no_traceback(
+    client: httpx.AsyncClient, json_logs: Any, sqlstate: str
+) -> None:
+    """Затор на общих строках (долгий замок, взаимная блокировка) это «повторите», а не поломка."""
+    response = await client.get(f"/database/{sqlstate}")
+
+    assert_problem(response, ErrorCode.SERVICE_UNAVAILABLE, path=f"/database/{sqlstate}")
+    assert response.headers["retry-after"] == "1"
+    assert SECRET_INPUT not in response.text
+    records = json_logs()
+    assert not any(r["event"] == "unhandled_exception" for r in records)
+    (contention,) = [r for r in records if r["event"] == "database_contention"]
+    assert contention["sqlstate"] == sqlstate
+    assert contention["level"] == "warning"
+    assert SECRET_INPUT not in json.dumps(records)
+
+
+@pytest.mark.parametrize("sqlstate", ["23505", "53200", "42P01"])
+async def test_other_database_errors_stay_internal_errors(
+    client: httpx.AsyncClient, json_logs: Any, sqlstate: str
+) -> None:
+    response = await client.get(f"/database/{sqlstate}")
+
+    assert_problem(response, ErrorCode.INTERNAL_ERROR, path=f"/database/{sqlstate}")
+    assert "retry-after" not in response.headers
+    records = json_logs()
+    assert any(r["event"] == "unhandled_exception" for r in records)
+    assert not any(r["event"] == "database_contention" for r in records)
 
 
 # ----------------------------------------------------------------------------- валидация

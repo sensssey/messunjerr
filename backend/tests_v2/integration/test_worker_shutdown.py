@@ -23,6 +23,23 @@ STARTUP_SECONDS = 40
 STOP_SECONDS = 30
 
 
+def _worker_env(test_settings: Settings, **extra: str) -> dict[str, str]:
+    """Окружение процесса воркера.
+
+    `APP_ENV` задан явно: без него процесс стартует как `prod` и требует `PUBLIC_BASE_URL`, адрес и ключи
+    хранилища. В контейнере разработки эти переменные есть, в CI нет, и тест без этой строки там падал.
+    """
+    return {
+        **os.environ,
+        "APP_ENV": test_settings.app_env,
+        "DATABASE_URL": test_settings.database_url.get_secret_value(),
+        "REDIS_URL": test_settings.redis_url.get_secret_value(),
+        "LOG_FORMAT": "json",
+        "LOG_LEVEL": "INFO",
+        **extra,
+    }
+
+
 def _wait_for(log: IO[str], text: str, seconds: float) -> str:
     deadline = time.monotonic() + seconds
     content = ""
@@ -37,13 +54,7 @@ def _wait_for(log: IO[str], text: str, seconds: float) -> str:
 
 @pytest.mark.parametrize("queue", ["default", "media"])
 def test_a_worker_stops_cleanly_on_sigterm(test_settings: Settings, queue: str) -> None:
-    env = {
-        **os.environ,
-        "DATABASE_URL": test_settings.database_url.get_secret_value(),
-        "REDIS_URL": test_settings.redis_url.get_secret_value(),
-        "LOG_FORMAT": "json",
-        "LOG_LEVEL": "INFO",
-    }
+    env = _worker_env(test_settings)
     # Хранилище не нужно ни одному из них для запуска: клиент S3 создаётся лениво, при первом обращении.
     with tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(  # noqa: S603 (запускаем собственный модуль)
@@ -79,14 +90,7 @@ def test_a_worker_serves_metrics_on_its_port_and_frees_it_on_exit(test_settings:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
-    env = {
-        **os.environ,
-        "DATABASE_URL": test_settings.database_url.get_secret_value(),
-        "REDIS_URL": test_settings.redis_url.get_secret_value(),
-        "LOG_FORMAT": "json",
-        "LOG_LEVEL": "INFO",
-        "WORKER_METRICS_PORT": str(port),
-    }
+    env = _worker_env(test_settings, WORKER_METRICS_PORT=str(port))
     with tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(
             [sys.executable, "-m", "messunjerr", "worker", "--queue", "media"],

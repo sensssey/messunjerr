@@ -3,7 +3,8 @@
 Сервисы приходят из окружения: их поднимает Compose (`make test`) или CI. Нужны переменные
 ADMIN_DATABASE_URL, DATABASE_URL, MIGRATOR_DATABASE_URL и REDIS_URL; если их нет, тесты
 пропускаются с понятным сообщением. Каждый прогон создаёт отдельную базу `mj_test_<hex>`,
-доводит её миграциями до head и в конце удаляет, а Redis использует базу №15.
+доводит её миграциями до head и в конце удаляет, а Redis использует базу №15 (номер можно задать
+переменной `REDIS_TEST_DB`: параллельные прогоны в разных копиях репозитория стирали бы друг у друга данные).
 """
 
 import asyncio
@@ -44,7 +45,7 @@ from messunjerr.settings import Settings
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 REQUIRED_ENV = ("ADMIN_DATABASE_URL", "DATABASE_URL", "MIGRATOR_DATABASE_URL", "REDIS_URL")
-REDIS_TEST_DB = 15
+REDIS_TEST_DB = int(os.environ.get("REDIS_TEST_DB", "15"))
 TEST_JWT_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"  # base64url от байтов 0..31
 
 

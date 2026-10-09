@@ -60,6 +60,9 @@ def test_default_buckets_match_the_specification_table() -> None:
         "api_read": (600, 60),
         "api_write": (120, 60),
         "upload_init": (60, 3600),
+        "friend_request": (30, 86_400),
+        "follow": (100, 3600),
+        "search": (30, 60),
     }
     assert {name: (b.limit, b.window_seconds) for name, b in buckets.items()} == expected
 

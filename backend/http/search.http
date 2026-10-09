@@ -1,0 +1,105 @@
+### messunjerr API v2: поиск людей (спринт S8)
+#
+# Запросы для HTTP-клиента JetBrains (в VS Code с REST Client скрипты `> {% %}` не выполняются:
+# токен из письма тогда копируется руками). Стек поднимает `make up` или `./dev.ps1 up`, письма
+# смотрим в Mailpit: http://localhost:8025. Чтобы было что искать, один раз выполните
+# `make seed-big` (`./dev.ps1 seed-big`): 5 000 человек big_00001… с русскими именами, друзьями и
+# подписками, повтор безопасен. Выполняйте запросы по порядку, сверху вниз: шаги 1-4 заводят вас.
+# Себя поиск не показывает, а связи (друзья, подписки) видны в `relationship` каждой карточки;
+# чтобы увидеть их, войдите под big_00001 (пароль печатает `make seed-big`) и возьмите его токен.
+
+@host = http://localhost:8000
+@mailpit = http://localhost:8025
+@password = correct horse battery staple
+
+### 1. Регистрация
+< {%
+    const suffix = Math.random().toString(36).slice(2, 10);
+    client.global.set("user", "searcher_" + suffix);
+    client.global.set("email", "searcher_" + suffix + "@example.com");
+%}
+POST {{host}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "username": "{{user}}",
+  "password": "{{password}}",
+  "display_name": "Искатель",
+  "accept_terms": true
+}
+
+### 2. Письмо подтверждения
+GET {{mailpit}}/api/v1/search?query=to:{{email}}&limit=1
+
+> {%
+    client.global.set("mail_id", response.body.messages[0].ID);
+%}
+
+### 3. Токен из письма
+GET {{mailpit}}/api/v1/message/{{mail_id}}
+
+> {%
+    client.global.set("verify", response.body.Text.match(/#token=(\S+)/)[1]);
+%}
+
+### 4. Подтверждение почты и вход
+POST {{host}}/api/v1/auth/verify-email
+Content-Type: application/json
+
+{ "token": "{{verify}}" }
+
+> {%
+    client.global.set("token", response.body.access_token);
+%}
+
+### Поиск #################################################################################
+
+### 5. Имя и фамилия в любом порядке, «ё» как «е»: «петр елкин» находит и «Пётр Ёлкин», и «Ёлкин Пётр»
+# Лимиты: 30 поисков в минуту на человека (`search`) и общий `api_read`. Ответ: `items` (карточка
+# `user` и `relationship` зрителя) и `next_offset`. Регистр не важен.
+GET {{host}}/api/v1/search/users?q=петр елкин&limit=20
+Authorization: Bearer {{token}}
+
+### 6. Начало слова (от двух букв) и опечатка
+GET {{host}}/api/v1/search/users?q=ив
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/v1/search/users?q=ивонов
+Authorization: Bearer {{token}}
+
+### 7. Ник: точное совпадение первым, затем ники с таким началом, затем остальные по сходству
+GET {{host}}/api/v1/search/users?q=big_00012
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/v1/search/users?q=big_0012
+Authorization: Bearer {{token}}
+
+### 8. Следующая страница: `offset` = next_offset из прошлого ответа
+# Глубже 200 результатов не листается: `offset + limit` не больше 200, иначе 422 out_of_range
+# (в `meta.max` сколько ещё допустимо). Когда `next_offset` равен null, уточните запрос.
+GET {{host}}/api/v1/search/users?q=анна&limit=20&offset=20
+Authorization: Bearer {{token}}
+
+### 9. Закрытые профили находятся, но поиск отдаёт только ник, имя и аватар (нужен `make seed`: seed_0005 закрыт)
+GET {{host}}/api/v1/search/users?q=seed_0005
+Authorization: Bearer {{token}}
+
+### Негативные случаи ####################################################################
+
+### Слишком короткий запрос: 422 validation_error, pointer /query/q, код string_too_short
+GET {{host}}/api/v1/search/users?q=а
+Authorization: Bearer {{token}}
+
+### Слишком глубокая страница: 422 validation_error, код out_of_range, в meta.max допустимый остаток
+GET {{host}}/api/v1/search/users?q=анна&limit=50&offset=180
+Authorization: Bearer {{token}}
+
+### Лимит больше 50: 422 validation_error по pointer /query/limit
+GET {{host}}/api/v1/search/users?q=анна&limit=51
+Authorization: Bearer {{token}}
+
+### Без токена: 401 token_missing
+GET {{host}}/api/v1/search/users?q=анна

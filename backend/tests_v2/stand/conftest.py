@@ -88,7 +88,8 @@ async def client(stand: Stand) -> AsyncGenerator[httpx.AsyncClient]:
 PASSWORD = "correct horse battery staple"
 RESET_HINT = (
     "лимит запросов стенда исчерпан (регистраций с одного адреса 5 в час, заявок на загрузку 60 в час "
-    "на человека): подождите или сбросьте счётчики командой `make stand-reset-limits`"
+    "на человека, заявок в друзья 30 в сутки, подписок 100 в час, поисков людей 30 в минуту): "
+    "подождите или сбросьте счётчики командой `make stand-reset-limits`"
 )
 
 

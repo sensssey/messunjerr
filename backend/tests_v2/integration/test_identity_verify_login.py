@@ -61,7 +61,7 @@ async def test_verification_activates_the_account_and_signs_in(
     auth = response.json()
     assert set(auth) == {"access_token", "token_type", "expires_in", "session_id", "user"}
     assert auth["token_type"] == "Bearer"
-    assert auth["expires_in"] == 600
+    assert auth["expires_in"] == 1200
     user = auth["user"]
     assert user["email"] == body["email"]
     assert user["username"] == body["username"]
